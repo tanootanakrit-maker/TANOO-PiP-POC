@@ -22,8 +22,12 @@
     <string>1</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
+    <key>NSCameraUsageDescription</key>
+    <string>TANOO Camera ใช้กล้องหน้าเพื่อถ่ายวิดีโอพร้อม Teleprompter</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>TANOO Teleprompter ใช้ไมโครโฟนเพื่อเลื่อนข้อความตามเสียงในโหมด Voice และ Hybrid</string>
+    <string>TANOO Teleprompter ใช้ไมโครโฟนเพื่อบันทึกเสียงและเลื่อนข้อความตามเสียงในโหมด Voice และ Hybrid</string>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>TANOO Camera บันทึกวิดีโอที่ถ่ายเสร็จลงใน Photos</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>TANOO Teleprompter ใช้ Speech Recognition ภาษาไทยเพื่อเลื่อนข้อความตามคำพูด</string>
     <key>UILaunchScreen</key>
