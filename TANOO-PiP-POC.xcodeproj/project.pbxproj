@@ -9,6 +9,7 @@
 		A10000000000000000000001 /* TANOO_PiP_POCApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* TANOO_PiP_POCApp.swift */; };
 		A10000000000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* ContentView.swift */; };
 		A10000000000000000000003 /* PiPController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* PiPController.swift */; };
+		A10000000000000000000006 /* CameraStudio.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* CameraStudio.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -16,6 +17,7 @@
 		A20000000000000000000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		A20000000000000000000003 /* PiPController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PiPController.swift; sourceTree = "<group>"; };
 		A20000000000000000000004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A20000000000000000000006 /* CameraStudio.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraStudio.swift; sourceTree = "<group>"; };
 		A20000000000000000000005 /* TANOO-PiP-POC.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "TANOO-PiP-POC.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -43,6 +45,7 @@
 				A20000000000000000000001 /* TANOO_PiP_POCApp.swift */,
 				A20000000000000000000002 /* ContentView.swift */,
 				A20000000000000000000003 /* PiPController.swift */,
+				A20000000000000000000006 /* CameraStudio.swift */,
 				A20000000000000000000004 /* Info.plist */,
 			);
 			path = "TANOO-PiP-POC";
@@ -117,6 +120,7 @@
 				A10000000000000000000001 /* TANOO_PiP_POCApp.swift in Sources */,
 				A10000000000000000000002 /* ContentView.swift in Sources */,
 				A10000000000000000000003 /* PiPController.swift in Sources */,
+				A10000000000000000000006 /* CameraStudio.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
