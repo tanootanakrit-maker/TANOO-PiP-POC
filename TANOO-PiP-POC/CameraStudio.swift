@@ -43,6 +43,7 @@ final class CameraController: NSObject, ObservableObject {
     @Published var frameRate: Double = 30
 
     @Published private(set) var isConfigured = false
+    @Published private(set) var isPreviewOnly = false
     @Published private(set) var isRunning = false
     @Published private(set) var isRecording = false
     @Published private(set) var statusText = "กำลังเตรียมกล้อง…"
@@ -77,6 +78,33 @@ final class CameraController: NSObject, ObservableObject {
     private var recordingTimer: Timer?
     private var currentRecordingURL: URL?
     private let speechBridge = CameraSpeechBridge()
+
+    func startPreviewOnly() {
+        statusText = "กำลังเปิดกล้องแบบ Safe Preview…"
+
+        let cameraStatus = AVCaptureDevice.authorizationStatus(for: .video)
+
+        let configure = { [weak self] in
+            guard let self else { return }
+            self.sessionQueue.async {
+                self.configurePreviewOnlySession()
+            }
+        }
+
+        if cameraStatus == .authorized {
+            configure()
+        } else {
+            AVCaptureDevice.requestAccess(for: .video) { granted in
+                guard granted else {
+                    Task { @MainActor in
+                        self.statusText = "ไม่ได้รับสิทธิ์ Camera"
+                    }
+                    return
+                }
+                configure()
+            }
+        }
+    }
 
     func start() {
         requestPermissionsAndConfigure()
@@ -271,6 +299,73 @@ final class CameraController: NSObject, ObservableObject {
         speechBridge.stop()
     }
 
+    private func configurePreviewOnlySession() {
+        if session.isRunning {
+            Task { @MainActor in
+                self.isRunning = true
+                self.statusText = "Safe Preview ทำงานแล้ว"
+            }
+            return
+        }
+
+        session.beginConfiguration()
+        var committed = false
+        defer {
+            if !committed {
+                session.commitConfiguration()
+            }
+        }
+
+        session.sessionPreset = .hd1920x1080
+
+        for input in session.inputs {
+            session.removeInput(input)
+        }
+        for output in session.outputs {
+            session.removeOutput(output)
+        }
+
+        guard let camera = AVCaptureDevice.default(.builtInTrueDepthCamera, for: .video, position: .front)
+            ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) else {
+            Task { @MainActor in
+                self.statusText = "ไม่พบกล้องหน้า"
+            }
+            return
+        }
+
+        do {
+            let input = try AVCaptureDeviceInput(device: camera)
+            guard session.canAddInput(input) else {
+                Task { @MainActor in
+                    self.statusText = "เพิ่มกล้องหน้าไม่ได้"
+                }
+                return
+            }
+
+            session.addInput(input)
+            videoInput = input
+            currentDevice = camera
+
+            session.commitConfiguration()
+            committed = true
+
+            session.startRunning()
+
+            Task { @MainActor in
+                self.isConfigured = true
+                self.isPreviewOnly = true
+                self.isRunning = self.session.isRunning
+                self.statusText = self.session.isRunning
+                    ? "Safe Preview ทำงานแล้ว — ยังไม่ได้เปิดไมค์/บันทึก/Hybrid"
+                    : "เปิด Safe Preview ไม่สำเร็จ"
+            }
+        } catch {
+            Task { @MainActor in
+                self.statusText = "Safe Preview ผิดพลาด: " + error.localizedDescription
+            }
+        }
+    }
+
     private func requestPermissionsAndConfigure() {
         let cameraStatus = AVCaptureDevice.authorizationStatus(for: .video)
         let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
@@ -377,6 +472,7 @@ final class CameraController: NSObject, ObservableObject {
 
             Task { @MainActor in
                 self.isConfigured = true
+                self.isPreviewOnly = false
                 self.isRunning = self.session.isRunning
                 self.statusText = "TANOO Camera พร้อมใช้งาน"
             }
@@ -818,6 +914,7 @@ private struct CameraTeleprompterOverlayView: UIViewRepresentable {
 struct CameraStudioView: View {
     @ObservedObject var camera: CameraController
     @ObservedObject var teleprompter: PiPController
+    @State private var cameraRequested = false
 
     var body: some View {
         NavigationStack {
@@ -839,7 +936,6 @@ struct CameraStudioView: View {
                         teleprompter.receiveExternalTranscript(transcript)
                     }
                 }
-                camera.start()
                 syncSpeech()
             }
             .onDisappear {
@@ -856,9 +952,38 @@ struct CameraStudioView: View {
 
     private var cameraSurface: some View {
         ZStack {
-            CameraPreview(controller: camera)
-                .aspectRatio(9.0 / 16.0, contentMode: .fit)
-                .clipped()
+            if cameraRequested {
+                CameraPreview(controller: camera)
+                    .aspectRatio(9.0 / 16.0, contentMode: .fit)
+                    .clipped()
+            } else {
+                Rectangle()
+                    .fill(Color.black)
+                    .aspectRatio(9.0 / 16.0, contentMode: .fit)
+                    .overlay {
+                        VStack(spacing: 14) {
+                            Image(systemName: "video.fill")
+                                .font(.system(size: 34))
+                                .foregroundStyle(.white)
+
+                            Text("Safe Launch")
+                                .font(.headline)
+                                .foregroundStyle(.white)
+
+                            Text("แอปจะยังไม่เปิดกล้องจนกว่าคุณจะกดปุ่มด้านล่าง")
+                                .font(.caption)
+                                .foregroundStyle(.white.opacity(0.75))
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 30)
+
+                            Button("เปิด Safe Preview") {
+                                cameraRequested = true
+                                camera.startPreviewOnly()
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+            }
 
             VStack {
                 HStack(spacing: 8) {
@@ -895,7 +1020,18 @@ struct CameraStudioView: View {
     private var controlsPanel: some View {
         ScrollView {
             VStack(spacing: 14) {
-                modeSelector
+                if !cameraRequested {
+                    Text("ขั้นตอนนี้ตั้งใจไม่เปิด Camera อัตโนมัติ เพื่อแยกสาเหตุแอปเด้ง")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else if camera.isPreviewOnly {
+                    Text("Safe Preview: ใช้เฉพาะกล้องหน้า 1080p โดยยังไม่เปิด Microphone, Recording, Cinematic, Pro/RAW หรือ Hybrid")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    modeSelector
 
                 HStack {
                     Picker("Resolution", selection: $camera.resolution) {
@@ -1019,6 +1155,8 @@ struct CameraStudioView: View {
                     .background(camera.isRecording ? Color.red : Color.red.opacity(0.82), in: RoundedRectangle(cornerRadius: 14))
                 }
 
+                }
+
                 Text(camera.statusText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -1074,7 +1212,7 @@ struct CameraStudioView: View {
     }
 
     private func syncSpeech() {
-        let shouldListen = teleprompter.isRunning && teleprompter.mode != .auto
+        let shouldListen = !camera.isPreviewOnly && teleprompter.isRunning && teleprompter.mode != .auto
         if shouldListen {
             camera.startSpeech()
         } else {
@@ -1094,14 +1232,14 @@ struct ContentView: View {
 
     var body: some View {
         TabView {
-            CameraStudioView(camera: camera, teleprompter: teleprompter)
-                .tabItem {
-                    Label("Camera", systemImage: "video.fill")
-                }
-
             TeleprompterSetupView(teleprompter: teleprompter)
                 .tabItem {
                     Label("Script", systemImage: "text.alignleft")
+                }
+
+            CameraStudioView(camera: camera, teleprompter: teleprompter)
+                .tabItem {
+                    Label("Camera", systemImage: "video.fill")
                 }
         }
     }
