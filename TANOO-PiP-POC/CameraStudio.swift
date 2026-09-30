@@ -115,7 +115,7 @@ final class CameraController: NSObject, ObservableObject {
 
     func selectMode(_ mode: CameraCaptureMode) {
         guard supportsMode(mode) else {
-            statusText = "(mode.title) ไม่รองรับกับกล้อง/Format ปัจจุบัน"
+            statusText = mode.title + " ไม่รองรับกับกล้อง/Format ปัจจุบัน"
             return
         }
         captureMode = mode
@@ -133,7 +133,7 @@ final class CameraController: NSObject, ObservableObject {
                 device.unlockForConfiguration()
             } catch {
                 Task { @MainActor in
-                    self.statusText = "ปรับ Zoom ไม่สำเร็จ: (error.localizedDescription)"
+                    self.statusText = "ปรับ Zoom ไม่สำเร็จ: " + error.localizedDescription
                 }
             }
         }
@@ -150,7 +150,7 @@ final class CameraController: NSObject, ObservableObject {
                 device.unlockForConfiguration()
             } catch {
                 Task { @MainActor in
-                    self.statusText = "ปรับแสงไม่สำเร็จ: (error.localizedDescription)"
+                    self.statusText = "ปรับแสงไม่สำเร็จ: " + error.localizedDescription
                 }
             }
         }
@@ -207,7 +207,7 @@ final class CameraController: NSObject, ObservableObject {
                 device.unlockForConfiguration()
             } catch {
                 Task { @MainActor in
-                    self.statusText = "ล็อก Focus/Exposure ไม่สำเร็จ: (error.localizedDescription)"
+                    self.statusText = "ล็อก Focus/Exposure ไม่สำเร็จ: " + error.localizedDescription
                 }
             }
         }
@@ -241,7 +241,7 @@ final class CameraController: NSObject, ObservableObject {
                 device.unlockForConfiguration()
             } catch {
                 Task { @MainActor in
-                    self.statusText = "แตะ Focus ไม่สำเร็จ: (error.localizedDescription)"
+                    self.statusText = "แตะ Focus ไม่สำเร็จ: " + error.localizedDescription
                 }
             }
         }
@@ -367,7 +367,7 @@ final class CameraController: NSObject, ObservableObject {
             }
         } catch {
             Task { @MainActor in
-                self.statusText = "ตั้งค่ากล้องไม่สำเร็จ: (error.localizedDescription)"
+                self.statusText = "ตั้งค่ากล้องไม่สำเร็จ: " + error.localizedDescription
             }
         }
     }
@@ -433,12 +433,12 @@ final class CameraController: NSObject, ObservableObject {
                 device.unlockForConfiguration()
             } catch {
                 Task { @MainActor in
-                    self.statusText = "เลือก (resolution.rawValue) (Int(frameRate))fps ไม่สำเร็จ"
+                    self.statusText = "เลือก " + self.resolution.rawValue + " " + String(Int(self.frameRate)) + "fps ไม่สำเร็จ"
                 }
             }
         } else {
             Task { @MainActor in
-                self.statusText = "ไม่พบ Format (resolution.rawValue) (Int(frameRate))fps สำหรับ (captureMode.title)"
+                self.statusText = "ไม่พบ Format " + self.resolution.rawValue + " " + String(Int(self.frameRate)) + "fps สำหรับ " + self.captureMode.title
             }
         }
 
@@ -577,14 +577,14 @@ final class CameraController: NSObject, ObservableObject {
         configureVideoConnection()
 
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("TANOO-(UUID().uuidString)")
+            .appendingPathComponent("TANOO-" + UUID().uuidString)
             .appendingPathExtension("mov")
 
         currentRecordingURL = url
         movieOutput.startRecording(to: url, recordingDelegate: self)
         isRecording = true
         recordingSeconds = 0
-        statusText = "REC • (captureMode.title) (resolution.rawValue) (Int(frameRate))fps"
+        statusText = "REC • " + captureMode.title + " " + resolution.rawValue + " " + String(Int(frameRate)) + "fps"
 
         recordingTimer?.invalidate()
         recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
@@ -618,7 +618,7 @@ final class CameraController: NSObject, ObservableObject {
                     if success {
                         self?.statusText = "บันทึกวิดีโอลง Photos แล้ว"
                     } else {
-                        self?.statusText = "บันทึก Photos ไม่สำเร็จ: (error?.localizedDescription ?? "Unknown error")"
+                        self?.statusText = "บันทึก Photos ไม่สำเร็จ: " + (error?.localizedDescription ?? "Unknown error")
                     }
                 }
                 try? FileManager.default.removeItem(at: url)
@@ -640,7 +640,7 @@ extension CameraController: AVCaptureFileOutputRecordingDelegate {
             self.recordingTimer = nil
 
             if let error {
-                self.statusText = "บันทึกวิดีโอผิดพลาด: (error.localizedDescription)"
+                self.statusText = "บันทึกวิดีโอผิดพลาด: " + error.localizedDescription
             } else {
                 self.saveVideoToPhotos(outputFileURL)
             }
@@ -849,7 +849,7 @@ struct CameraStudioView: View {
                 HStack(spacing: 8) {
                     badge(camera.captureMode.title)
                     badge(camera.resolution.rawValue)
-                    badge("(Int(camera.frameRate)) FPS")
+                    badge(String(Int(camera.frameRate)) + " FPS")
                     Spacer()
                     badge(String(format: "%.1fx", camera.zoomFactor))
                 }
@@ -865,7 +865,7 @@ struct CameraStudioView: View {
                 Spacer()
 
                 if camera.isRecording {
-                    Text("● REC  (formatDuration(camera.recordingSeconds))")
+                    Text("● REC  " + formatDuration(camera.recordingSeconds))
                         .font(.system(.headline, design: .monospaced).bold())
                         .foregroundStyle(.red)
                         .padding(.horizontal, 12)
