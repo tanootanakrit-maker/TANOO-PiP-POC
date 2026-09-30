@@ -146,6 +146,7 @@ final class PiPController: NSObject, ObservableObject {
     private var lastTick = CACurrentMediaTime()
 
     private weak var sourceView: TeleprompterVideoView?
+    private weak var cameraOverlayView: TeleprompterVideoView?
     private var pipContentView: TeleprompterVideoView?
     private var pipVideoCallViewController: AVPictureInPictureVideoCallViewController?
     private var pipController: AVPictureInPictureController?
@@ -154,6 +155,7 @@ final class PiPController: NSObject, ObservableObject {
 
     private let speechTracker = SpeechTracker()
     private var lastMatchedTranscript = ""
+    private var usesExternalSpeech = false
 
     private let projectsKey = "TANOO.savedProjects.v1"
 
@@ -247,6 +249,28 @@ final class PiPController: NSObject, ObservableObject {
         renderViews()
     }
 
+    func attachCameraOverlay(_ view: TeleprompterVideoView) {
+        cameraOverlayView = view
+        view.render(snapshot: snapshot())
+    }
+
+    func setUsesExternalSpeech(_ enabled: Bool) {
+        usesExternalSpeech = enabled
+        if enabled {
+            speechTracker.stop()
+            if mode != .auto {
+                speechStatus = "Voice ใช้เสียงจาก TANOO Camera"
+            }
+        } else if isRunning {
+            configureSpeechForCurrentMode()
+        }
+    }
+
+    func receiveExternalTranscript(_ transcript: String) {
+        guard usesExternalSpeech else { return }
+        handleTranscript(transcript)
+    }
+
     func togglePictureInPicture() {
         guard let controller = pipController else {
             statusText = "PiP Controller ยังไม่พร้อม"
@@ -302,7 +326,9 @@ final class PiPController: NSObject, ObservableObject {
         isRunning = false
         speechTracker.stop()
         speechStatus = "หยุด Voice แล้ว"
-        preparePlaybackAudioSession()
+        if !usesExternalSpeech {
+            preparePlaybackAudioSession()
+        }
         statusText = "Pause"
         renderViews()
     }
@@ -429,23 +455,35 @@ final class PiPController: NSObject, ObservableObject {
         let delta = max(0, min(now - lastTick, 0.25))
         lastTick = now
 
-        if isRunning && (mode == .auto || mode == .hybrid) && !segments.isEmpty {
+        if isRunning && !segments.isEmpty {
             let current = segments[min(currentIndex, segments.count - 1)]
-            let charCount = max(12, current.count)
-            let duration = max(1.0, Double(charCount) / (11.0 * autoSpeed))
-            progress += delta / duration
+            let isBlankLine = current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let shouldAutoAdvance = mode == .auto || mode == .hybrid || isBlankLine
 
-            while progress >= 1.0 {
-                progress -= 1.0
-                if currentIndex < segments.count - 1 {
-                    currentIndex += 1
-                    lastMatchedTranscript = ""
+            if shouldAutoAdvance {
+                let duration: Double
+                if isBlankLine {
+                    // A real empty script line is kept on screen as breathing/pacing space.
+                    duration = max(0.55, 0.9 / max(autoSpeed, 0.5))
                 } else {
-                    progress = 0
-                    isRunning = false
-                    speechTracker.stop()
-                    statusText = "จบสคริปต์"
-                    break
+                    let charCount = max(12, current.count)
+                    duration = max(1.0, Double(charCount) / (11.0 * autoSpeed))
+                }
+
+                progress += delta / duration
+
+                while progress >= 1.0 {
+                    progress -= 1.0
+                    if currentIndex < segments.count - 1 {
+                        currentIndex += 1
+                        lastMatchedTranscript = ""
+                    } else {
+                        progress = 0
+                        isRunning = false
+                        speechTracker.stop()
+                        statusText = "จบสคริปต์"
+                        break
+                    }
                 }
             }
         }
@@ -460,6 +498,12 @@ final class PiPController: NSObject, ObservableObject {
             speechTracker.stop()
             speechStatus = "Auto ไม่ใช้ไมโครโฟน"
             preparePlaybackAudioSession()
+            return
+        }
+
+        if usesExternalSpeech {
+            speechTracker.stop()
+            speechStatus = "Voice ใช้ไมโครโฟนจาก TANOO Camera"
             return
         }
 
@@ -559,29 +603,47 @@ final class PiPController: NSObject, ObservableObject {
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
 
-        var rawParts: [String] = []
-        var buffer = ""
-
-        for character in normalized {
-            if character == "\n" || character == "." || character == "!" || character == "?" || character == "。" || character == "！" || character == "？" {
-                let trimmed = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty {
-                    rawParts.append(trimmed)
-                }
-                buffer = ""
-            } else {
-                buffer.append(character)
-            }
-        }
-
-        let tail = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tail.isEmpty {
-            rawParts.append(tail)
-        }
-
+        // Important: each explicit empty line in the editor becomes an empty
+        // teleprompter segment. This preserves the user's speaking rhythm.
+        let lines = normalized.components(separatedBy: "\n")
         var result: [String] = []
-        for part in rawParts {
-            result.append(contentsOf: chunk(part, targetLength: 36))
+
+        for line in lines {
+            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+
+            if trimmedLine.isEmpty {
+                result.append("")
+                continue
+            }
+
+            var sentenceBuffer = ""
+            var sentenceParts: [String] = []
+
+            for character in trimmedLine {
+                sentenceBuffer.append(character)
+
+                if character == "." || character == "!" || character == "?" ||
+                    character == "。" || character == "！" || character == "？" {
+                    let part = sentenceBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !part.isEmpty {
+                        sentenceParts.append(part)
+                    }
+                    sentenceBuffer = ""
+                }
+            }
+
+            let tail = sentenceBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !tail.isEmpty {
+                sentenceParts.append(tail)
+            }
+
+            if sentenceParts.isEmpty {
+                sentenceParts.append(trimmedLine)
+            }
+
+            for part in sentenceParts {
+                result.append(contentsOf: chunk(part, targetLength: 36))
+            }
         }
 
         return result.isEmpty ? [""] : result
@@ -626,6 +688,7 @@ final class PiPController: NSObject, ObservableObject {
     private func renderViews() {
         let state = snapshot()
         sourceView?.render(snapshot: state)
+        cameraOverlayView?.render(snapshot: state)
         pipContentView?.render(snapshot: state)
     }
 
