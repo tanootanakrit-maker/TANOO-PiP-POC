@@ -1310,13 +1310,18 @@ struct CameraStudioView: View {
                 }
 
                 Button {
-                    if !camera.isRecording && !teleprompter.isRunning {
+                    let wasRecording = camera.isRecording
+
+                    if !wasRecording && !teleprompter.isRunning {
                         teleprompter.start()
                     }
+
                     syncSpeech()
                     camera.toggleRecording()
-                    if camera.isRecording == false && teleprompter.isRunning {
+
+                    if wasRecording && teleprompter.isRunning {
                         teleprompter.pause()
+                        camera.stopSpeech()
                     }
                 } label: {
                     HStack(spacing: 10) {
