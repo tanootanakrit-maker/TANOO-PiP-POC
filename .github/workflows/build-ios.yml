@@ -1,7 +1,9 @@
-name: Build TANOO PiP POC
+name: Build TANOO Teleprompter
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ main ]
 
 jobs:
   build:
