@@ -2,8 +2,8 @@ import SwiftUI
 import UniformTypeIdentifiers
 import UIKit
 
-struct ContentView: View {
-    @StateObject private var teleprompter = PiPController()
+struct TeleprompterSetupView: View {
+    @ObservedObject var teleprompter: PiPController
     @State private var showingProjects = false
     @State private var showingExporter = false
     @State private var exportDocument = TeleprompterTextDocument(text: "")
