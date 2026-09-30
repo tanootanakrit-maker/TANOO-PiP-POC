@@ -717,6 +717,7 @@ final class CameraController: NSObject, ObservableObject {
             connection.videoOrientation = .portrait
         }
         if connection.isVideoMirroringSupported {
+            connection.automaticallyAdjustsVideoMirroring = false
             connection.isVideoMirrored = true
         }
         if connection.isVideoStabilizationSupported {
@@ -987,10 +988,12 @@ struct CameraPreview: UIViewRepresentable {
 
     func makeUIView(context: Context) -> PreviewView {
         let view = PreviewView()
-        view.previewLayer.session = controller.session
-        view.previewLayer.videoGravity = .resizeAspectFill
+        view.setSession(controller.session)
 
-        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.didTap(_:)))
+        let tap = UITapGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.didTap(_:))
+        )
         view.addGestureRecognizer(tap)
         context.coordinator.previewView = view
 
@@ -998,15 +1001,15 @@ struct CameraPreview: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: PreviewView, context: Context) {
-        uiView.previewLayer.session = controller.session
-        if let connection = uiView.previewLayer.connection {
-            if connection.isVideoOrientationSupported {
-                connection.videoOrientation = .portrait
-            }
-            if connection.isVideoMirroringSupported {
-                connection.isVideoMirrored = true
-            }
-        }
+        // Do not repeatedly mutate AVCaptureConnection while SwiftUI updates.
+        // In the previous build the crash happened exactly when PreviewLayer
+        // was attached. Let AVCaptureVideoPreviewLayer manage front-camera
+        // mirroring automatically for this diagnostic.
+        uiView.setSession(controller.session)
+    }
+
+    static func dismantleUIView(_ uiView: PreviewView, coordinator: Coordinator) {
+        uiView.setSession(nil)
     }
 
     final class Coordinator: NSObject {
@@ -1027,8 +1030,33 @@ struct CameraPreview: UIViewRepresentable {
 }
 
 final class PreviewView: UIView {
-    override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
-    var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+    let previewLayer = AVCaptureVideoPreviewLayer()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .black
+        previewLayer.videoGravity = .resizeAspectFill
+        layer.addSublayer(previewLayer)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        previewLayer.frame = bounds
+        CATransaction.commit()
+    }
+
+    func setSession(_ session: AVCaptureSession?) {
+        precondition(Thread.isMainThread)
+        if previewLayer.session !== session {
+            previewLayer.session = session
+        }
+    }
 }
 
 private struct CameraTeleprompterOverlayView: UIViewRepresentable {
