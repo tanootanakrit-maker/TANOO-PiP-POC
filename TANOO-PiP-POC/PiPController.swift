@@ -3,27 +3,191 @@ import AVKit
 import AVFoundation
 import CoreMedia
 import CoreVideo
+import Speech
 import UIKit
+
+enum TeleprompterMode: String, Codable, CaseIterable, Identifiable {
+    case auto
+    case voice
+    case hybrid
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .auto: return "Auto"
+        case .voice: return "Voice"
+        case .hybrid: return "Hybrid"
+        }
+    }
+}
+
+enum PromptAlignment: String, Codable, CaseIterable, Identifiable {
+    case left
+    case center
+    case right
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .left: return "ซ้าย"
+        case .center: return "กลาง"
+        case .right: return "ขวา"
+        }
+    }
+
+    var nsAlignment: NSTextAlignment {
+        switch self {
+        case .left: return .left
+        case .center: return .center
+        case .right: return .right
+        }
+    }
+}
+
+enum PromptTextColor: String, Codable, CaseIterable, Identifiable {
+    case white
+    case cream
+    case gold
+    case green
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .white: return "ขาว"
+        case .cream: return "ครีม"
+        case .gold: return "ทอง"
+        case .green: return "เขียว"
+        }
+    }
+
+    var uiColor: UIColor {
+        switch self {
+        case .white:
+            return .white
+        case .cream:
+            return UIColor(red: 1.0, green: 0.96, blue: 0.84, alpha: 1)
+        case .gold:
+            return UIColor(red: 0.95, green: 0.78, blue: 0.36, alpha: 1)
+        case .green:
+            return UIColor(red: 0.70, green: 0.82, blue: 0.63, alpha: 1)
+        }
+    }
+}
+
+struct SavedProject: Codable, Identifiable {
+    let id: UUID
+    var name: String
+    var script: String
+    var mode: TeleprompterMode
+    var fontSize: Double
+    var lineSpacing: Double
+    var autoSpeed: Double
+    var verticalPosition: Double
+    var backgroundOpacity: Double
+    var textAlignment: PromptAlignment
+    var textColorStyle: PromptTextColor
+    var updatedAt: Date
+}
+
+struct TeleprompterSnapshot {
+    var segments: [String]
+    var currentIndex: Int
+    var progress: Double
+    var fontSize: CGFloat
+    var lineSpacing: CGFloat
+    var verticalPosition: Double
+    var backgroundOpacity: Double
+    var alignment: PromptAlignment
+    var textColor: PromptTextColor
+    var isRunning: Bool
+}
 
 @MainActor
 final class PiPController: NSObject, ObservableObject {
+    @Published var projectName = "TANOO Script"
+    @Published var scriptText = """
+    สวัสดีครับ นี่คือ TANOO Teleprompter
+
+    ข้อความจะเลื่อนไปทีละช่วงอย่างต่อเนื่อง
+    คุณสามารถเลือก Auto, Voice หรือ Hybrid ได้
+
+    เมื่อพร้อม ให้เปิด Live PiP แล้วสลับไปที่แอป Camera ของ Apple
+    """
+    @Published var mode: TeleprompterMode = .auto
+    @Published var fontSize: CGFloat = 44
+    @Published var lineSpacing: CGFloat = 10
+    @Published var autoSpeed: Double = 1.0
+    @Published var verticalPosition: Double = 0.18
+    @Published var backgroundOpacity: Double = 0.78
+    @Published var textAlignment: PromptAlignment = .center
+    @Published var textColorStyle: PromptTextColor = .cream
+
+    @Published private(set) var currentIndex = 0
+    @Published private(set) var isRunning = false
     @Published private(set) var isPictureInPictureActive = false
     @Published private(set) var isControllerReady = false
     @Published private(set) var isPictureInPicturePossible = false
-    @Published private(set) var statusText = "กำลังเตรียม PiP แบบ Live…"
+    @Published private(set) var statusText = "กำลังเตรียม Live PiP…"
+    @Published private(set) var speechStatus = "Voice ยังไม่เริ่ม"
+    @Published private(set) var savedProjects: [SavedProject] = []
+    @Published var exportStatus = ""
 
     let isSupported = AVPictureInPictureController.isPictureInPictureSupported()
+
+    private var segments: [String] = []
+    private var progress: Double = 0
+    private var lastTick = CACurrentMediaTime()
 
     private weak var sourceView: TeleprompterVideoView?
     private var pipContentView: TeleprompterVideoView?
     private var pipVideoCallViewController: AVPictureInPictureVideoCallViewController?
     private var pipController: AVPictureInPictureController?
     private var pipPossibleObservation: NSKeyValueObservation?
-    private var renderTimer: Timer?
+    private var engineTimer: Timer?
+
+    private let speechTracker = SpeechTracker()
+    private var lastMatchedTranscript = ""
+
+    private let projectsKey = "TANOO.savedProjects.v1"
+
+    override init() {
+        super.init()
+        rebuildSegments(reset: true)
+        loadSavedProjects()
+        startEngineTimer()
+    }
+
+    var segmentCount: Int { segments.count }
+
+    var safeExportFilename: String {
+        let invalid = CharacterSet(charactersIn: "/\\?%*|\"<>:")
+        let parts = projectName.components(separatedBy: invalid)
+        let cleaned = parts.joined(separator: "-").trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "TANOO-Script" : cleaned
+    }
+
+    func snapshot() -> TeleprompterSnapshot {
+        TeleprompterSnapshot(
+            segments: segments,
+            currentIndex: currentIndex,
+            progress: progress,
+            fontSize: fontSize,
+            lineSpacing: lineSpacing,
+            verticalPosition: verticalPosition,
+            backgroundOpacity: backgroundOpacity,
+            alignment: textAlignment,
+            textColor: textColorStyle,
+            isRunning: isRunning
+        )
+    }
 
     func attach(to sourceView: TeleprompterVideoView) {
         guard self.sourceView !== sourceView else { return }
         self.sourceView = sourceView
+        sourceView.render(snapshot: snapshot())
 
         guard isSupported else {
             statusText = "อุปกรณ์นี้ไม่รองรับ Picture in Picture"
@@ -31,21 +195,15 @@ final class PiPController: NSObject, ObservableObject {
             return
         }
 
-        do {
-            let audioSession = AVAudioSession.sharedInstance()
-            try audioSession.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
-            try audioSession.setActive(true)
-        } catch {
-            statusText = "เตรียมระบบ PiP ไม่สมบูรณ์: \(error.localizedDescription)"
-        }
+        preparePlaybackAudioSession()
 
         let pipView = TeleprompterVideoView()
         pipView.translatesAutoresizingMaskIntoConstraints = false
-        pipView.renderFrame()
+        pipView.render(snapshot: snapshot())
 
         let videoCallVC = AVPictureInPictureVideoCallViewController()
-        videoCallVC.preferredContentSize = CGSize(width: 960, height: 360)
-        videoCallVC.view.backgroundColor = .black
+        videoCallVC.preferredContentSize = CGSize(width: 960, height: 420)
+        videoCallVC.view.backgroundColor = .clear
         videoCallVC.view.addSubview(pipView)
 
         NSLayoutConstraint.activate([
@@ -77,13 +235,12 @@ final class PiPController: NSObject, ObservableObject {
                 guard let self else { return }
                 self.isPictureInPicturePossible = controller.isPictureInPicturePossible
                 self.statusText = controller.isPictureInPicturePossible
-                    ? "พร้อมทดสอบ Live PiP — กด เปิด PiP"
+                    ? "พร้อมใช้งาน — เปิด Live PiP ได้"
                     : "PiP Controller พร้อมแล้ว กำลังรอระบบอนุญาต…"
             }
         }
 
-        startRendering()
-        statusText = "PiP Controller พร้อมแล้ว กำลังรอระบบอนุญาต…"
+        renderViews()
     }
 
     func togglePictureInPicture() {
@@ -97,8 +254,7 @@ final class PiPController: NSObject, ObservableObject {
             return
         }
 
-        sourceView?.renderFrame()
-        pipContentView?.renderFrame()
+        renderViews()
 
         guard controller.isPictureInPicturePossible else {
             statusText = "PiP ยังไม่พร้อม ลองรอ 1–2 วินาทีแล้วกดอีกครั้ง"
@@ -108,16 +264,367 @@ final class PiPController: NSObject, ObservableObject {
         controller.startPictureInPicture()
     }
 
-    private func startRendering() {
-        renderTimer?.invalidate()
-        renderTimer = Timer.scheduledTimer(withTimeInterval: 0.75, repeats: true) { [weak self] _ in
+    func scriptDidChange() {
+        rebuildSegments(reset: false)
+        renderViews()
+    }
+
+    func modeDidChange() {
+        if isRunning {
+            configureSpeechForCurrentMode()
+        } else {
+            speechTracker.stop()
+            speechStatus = mode == .auto ? "Auto ไม่ใช้ไมโครโฟน" : "Voice พร้อมเมื่อกด Start"
+        }
+    }
+
+    func toggleRunning() {
+        isRunning ? pause() : start()
+    }
+
+    func start() {
+        guard !segments.isEmpty else {
+            statusText = "กรุณาใส่สคริปต์ก่อน"
+            return
+        }
+        isRunning = true
+        lastTick = CACurrentMediaTime()
+        configureSpeechForCurrentMode()
+        statusText = "กำลังทำงาน: \(mode.title)"
+        renderViews()
+    }
+
+    func pause() {
+        isRunning = false
+        speechTracker.stop()
+        speechStatus = "หยุด Voice แล้ว"
+        preparePlaybackAudioSession()
+        statusText = "Pause"
+        renderViews()
+    }
+
+    func previous() {
+        currentIndex = max(0, currentIndex - 1)
+        progress = 0
+        lastMatchedTranscript = ""
+        renderViews()
+    }
+
+    func next() {
+        advanceOneSegment(source: "manual")
+    }
+
+    func resetPosition() {
+        currentIndex = 0
+        progress = 0
+        lastMatchedTranscript = ""
+        renderViews()
+    }
+
+    func saveCurrentProject() {
+        let name = projectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "TANOO Script"
+            : projectName.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let project = SavedProject(
+            id: UUID(),
+            name: name,
+            script: scriptText,
+            mode: mode,
+            fontSize: Double(fontSize),
+            lineSpacing: Double(lineSpacing),
+            autoSpeed: autoSpeed,
+            verticalPosition: verticalPosition,
+            backgroundOpacity: backgroundOpacity,
+            textAlignment: textAlignment,
+            textColorStyle: textColorStyle,
+            updatedAt: Date()
+        )
+
+        if let index = savedProjects.firstIndex(where: { $0.name == name }) {
+            var updated = project
+            updated = SavedProject(
+                id: savedProjects[index].id,
+                name: project.name,
+                script: project.script,
+                mode: project.mode,
+                fontSize: project.fontSize,
+                lineSpacing: project.lineSpacing,
+                autoSpeed: project.autoSpeed,
+                verticalPosition: project.verticalPosition,
+                backgroundOpacity: project.backgroundOpacity,
+                textAlignment: project.textAlignment,
+                textColorStyle: project.textColorStyle,
+                updatedAt: project.updatedAt
+            )
+            savedProjects[index] = updated
+        } else {
+            savedProjects.insert(project, at: 0)
+        }
+
+        persistProjects()
+        statusText = "บันทึกโปรเจกต์ “\(name)” แล้ว"
+    }
+
+    func loadProject(_ id: UUID) {
+        guard let project = savedProjects.first(where: { $0.id == id }) else { return }
+        projectName = project.name
+        scriptText = project.script
+        mode = project.mode
+        fontSize = CGFloat(project.fontSize)
+        lineSpacing = CGFloat(project.lineSpacing)
+        autoSpeed = project.autoSpeed
+        verticalPosition = project.verticalPosition
+        backgroundOpacity = project.backgroundOpacity
+        textAlignment = project.textAlignment
+        textColorStyle = project.textColorStyle
+        rebuildSegments(reset: true)
+        modeDidChange()
+        statusText = "โหลดโปรเจกต์ “\(project.name)” แล้ว"
+        renderViews()
+    }
+
+    func deleteProjects(at offsets: IndexSet) {
+        savedProjects.remove(atOffsets: offsets)
+        persistProjects()
+    }
+
+    private func loadSavedProjects() {
+        guard let data = UserDefaults.standard.data(forKey: projectsKey),
+              let projects = try? JSONDecoder().decode([SavedProject].self, from: data) else {
+            return
+        }
+        savedProjects = projects.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private func persistProjects() {
+        guard let data = try? JSONEncoder().encode(savedProjects) else { return }
+        UserDefaults.standard.set(data, forKey: projectsKey)
+    }
+
+    private func startEngineTimer() {
+        engineTimer?.invalidate()
+        engineTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.sourceView?.renderFrame()
-                self?.pipContentView?.renderFrame()
+                self?.tick()
             }
         }
-        if let renderTimer {
-            RunLoop.main.add(renderTimer, forMode: .common)
+        if let engineTimer {
+            RunLoop.main.add(engineTimer, forMode: .common)
+        }
+    }
+
+    private func tick() {
+        let now = CACurrentMediaTime()
+        let delta = max(0, min(now - lastTick, 0.25))
+        lastTick = now
+
+        if isRunning && (mode == .auto || mode == .hybrid) && !segments.isEmpty {
+            let current = segments[min(currentIndex, segments.count - 1)]
+            let charCount = max(12, current.count)
+            let duration = max(1.0, Double(charCount) / (11.0 * autoSpeed))
+            progress += delta / duration
+
+            while progress >= 1.0 {
+                progress -= 1.0
+                if currentIndex < segments.count - 1 {
+                    currentIndex += 1
+                    lastMatchedTranscript = ""
+                } else {
+                    progress = 0
+                    isRunning = false
+                    speechTracker.stop()
+                    statusText = "จบสคริปต์"
+                    break
+                }
+            }
+        }
+
+        if isPictureInPictureActive || isRunning {
+            renderViews()
+        }
+    }
+
+    private func configureSpeechForCurrentMode() {
+        if mode == .auto {
+            speechTracker.stop()
+            speechStatus = "Auto ไม่ใช้ไมโครโฟน"
+            preparePlaybackAudioSession()
+            return
+        }
+
+        speechStatus = "กำลังขอสิทธิ์ Voice…"
+
+        speechTracker.start(
+            onStatus: { [weak self] message in
+                Task { @MainActor in
+                    self?.speechStatus = message
+                }
+            },
+            onTranscript: { [weak self] transcript in
+                Task { @MainActor in
+                    self?.handleTranscript(transcript)
+                }
+            },
+            onFailure: { [weak self] message in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.speechStatus = message
+                    if self.mode == .hybrid {
+                        self.statusText = "Voice ใช้ไม่ได้ชั่วคราว — Hybrid ทำ Auto ต่อ"
+                        self.preparePlaybackAudioSession()
+                    } else {
+                        self.statusText = "Voice หยุด: \(message)"
+                    }
+                }
+            }
+        )
+    }
+
+    private func handleTranscript(_ transcript: String) {
+        guard isRunning, mode != .auto, currentIndex < segments.count else { return }
+
+        speechStatus = "ได้ยิน: \(transcript.suffix(60))"
+
+        let normalizedTranscript = normalizeForMatching(transcript)
+        let target = normalizeForMatching(segments[currentIndex])
+
+        guard target.count >= 4 else { return }
+
+        let prefixLength = min(max(6, target.count / 3), 18)
+        let prefix = String(target.prefix(prefixLength))
+
+        let matched = normalizedTranscript.contains(prefix)
+            || (target.count <= 18 && normalizedTranscript.contains(target))
+
+        if matched && normalizedTranscript != lastMatchedTranscript {
+            lastMatchedTranscript = normalizedTranscript
+            advanceOneSegment(source: "voice")
+        }
+    }
+
+    private func normalizeForMatching(_ text: String) -> String {
+        let lowered = text.lowercased()
+        let allowed = lowered.unicodeScalars.filter {
+            CharacterSet.letters.contains($0) || CharacterSet.decimalDigits.contains($0)
+        }
+        return String(String.UnicodeScalarView(allowed))
+    }
+
+    private func advanceOneSegment(source: String) {
+        guard !segments.isEmpty else { return }
+
+        if currentIndex < segments.count - 1 {
+            currentIndex += 1
+            progress = 0
+            lastMatchedTranscript = ""
+            if source == "voice" {
+                statusText = mode == .hybrid ? "Hybrid: Voice ข้ามไปช่วงถัดไป" : "Voice: ไปช่วงถัดไป"
+            }
+        } else {
+            progress = 0
+            isRunning = false
+            speechTracker.stop()
+            statusText = "จบสคริปต์"
+        }
+
+        renderViews()
+    }
+
+    private func rebuildSegments(reset: Bool) {
+        let oldIndex = currentIndex
+        segments = Self.segmentScript(scriptText)
+
+        if reset {
+            currentIndex = 0
+            progress = 0
+        } else {
+            currentIndex = min(oldIndex, max(segments.count - 1, 0))
+        }
+    }
+
+    private static func segmentScript(_ script: String) -> [String] {
+        let normalized = script
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+
+        var rawParts: [String] = []
+        var buffer = ""
+
+        for character in normalized {
+            if character == "\n" || character == "." || character == "!" || character == "?" || character == "。" || character == "！" || character == "？" {
+                let trimmed = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    rawParts.append(trimmed)
+                }
+                buffer = ""
+            } else {
+                buffer.append(character)
+            }
+        }
+
+        let tail = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty {
+            rawParts.append(tail)
+        }
+
+        var result: [String] = []
+        for part in rawParts {
+            result.append(contentsOf: chunk(part, targetLength: 52))
+        }
+
+        return result.isEmpty ? [""] : result
+    }
+
+    private static func chunk(_ text: String, targetLength: Int) -> [String] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > targetLength else { return trimmed.isEmpty ? [] : [trimmed] }
+
+        let words = trimmed.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+
+        if words.count > 1 {
+            var chunks: [String] = []
+            var current = ""
+
+            for word in words {
+                let candidate = current.isEmpty ? word : current + " " + word
+                if candidate.count > targetLength && !current.isEmpty {
+                    chunks.append(current)
+                    current = word
+                } else {
+                    current = candidate
+                }
+            }
+
+            if !current.isEmpty {
+                chunks.append(current)
+            }
+            return chunks
+        }
+
+        var chunks: [String] = []
+        var index = trimmed.startIndex
+        while index < trimmed.endIndex {
+            let end = trimmed.index(index, offsetBy: targetLength, limitedBy: trimmed.endIndex) ?? trimmed.endIndex
+            chunks.append(String(trimmed[index..<end]))
+            index = end
+        }
+        return chunks
+    }
+
+    private func renderViews() {
+        let state = snapshot()
+        sourceView?.render(snapshot: state)
+        pipContentView?.render(snapshot: state)
+    }
+
+    private func preparePlaybackAudioSession() {
+        do {
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
+            try audioSession.setActive(true)
+        } catch {
+            statusText = "เตรียมระบบเสียงสำหรับ PiP ไม่สำเร็จ: \(error.localizedDescription)"
         }
     }
 }
@@ -127,7 +634,7 @@ extension PiPController: AVPictureInPictureControllerDelegate {
         _ pictureInPictureController: AVPictureInPictureController
     ) {
         Task { @MainActor in
-            self.pipContentView?.renderFrame()
+            self.renderViews()
             self.statusText = "กำลังเปิด Live PiP…"
         }
     }
@@ -137,8 +644,8 @@ extension PiPController: AVPictureInPictureControllerDelegate {
     ) {
         Task { @MainActor in
             self.isPictureInPictureActive = true
-            self.pipContentView?.renderFrame()
-            self.statusText = "Live PiP ทำงานแล้ว — เปิด Camera เพื่อทดสอบ"
+            self.renderViews()
+            self.statusText = "Live PiP ทำงานแล้ว — เปิด Camera ได้"
         }
     }
 
@@ -182,7 +689,8 @@ final class TeleprompterVideoView: UIView {
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        backgroundColor = .black
+        backgroundColor = .clear
+        isOpaque = false
         displayLayer.videoGravity = .resizeAspect
     }
 
@@ -190,13 +698,13 @@ final class TeleprompterVideoView: UIView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func renderFrame() {
+    func render(snapshot: TeleprompterSnapshot) {
         if displayLayer.status == .failed {
             displayLayer.flush()
         }
 
         let width = 960
-        let height = 360
+        let height = 420
 
         guard let pixelBuffer = makePixelBuffer(width: width, height: height) else { return }
 
@@ -216,7 +724,8 @@ final class TeleprompterVideoView: UIView {
             )
         else { return }
 
-        context.setFillColor(UIColor.black.cgColor)
+        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
+        context.setFillColor(UIColor.black.withAlphaComponent(snapshot.backgroundOpacity).cgColor)
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
 
         context.saveGState()
@@ -225,38 +734,38 @@ final class TeleprompterVideoView: UIView {
         UIGraphicsPushContext(context)
 
         let paragraph = NSMutableParagraphStyle()
-        paragraph.alignment = .center
-        paragraph.lineSpacing = 8
+        paragraph.alignment = snapshot.alignment.nsAlignment
+        paragraph.lineSpacing = snapshot.lineSpacing
 
-        let titleAttributes: [NSAttributedString.Key: Any] = [
-            .font: UIFont.systemFont(ofSize: 48, weight: .bold),
-            .foregroundColor: UIColor.white,
-            .paragraphStyle: paragraph
-        ]
+        let blockHeight = max(snapshot.fontSize * 1.75 + snapshot.lineSpacing, 72)
+        let startY = CGFloat(height) * CGFloat(snapshot.verticalPosition) - CGFloat(snapshot.progress) * blockHeight
 
-        let bodyAttributes: [NSAttributedString.Key: Any] = [
-            .font: UIFont.systemFont(ofSize: 34, weight: .medium),
-            .foregroundColor: UIColor.white,
-            .paragraphStyle: paragraph
-        ]
+        let current = max(0, min(snapshot.currentIndex, snapshot.segments.count - 1))
 
-        NSAttributedString(
-            string: "TANOO TELEPROMPTER",
-            attributes: titleAttributes
-        ).draw(
-            with: CGRect(x: 50, y: 72, width: width - 100, height: 70),
-            options: [.usesLineFragmentOrigin, .usesFontLeading],
-            context: nil
-        )
+        if !snapshot.segments.isEmpty {
+            for offset in 0..<4 {
+                let index = current + offset
+                guard index < snapshot.segments.count else { break }
 
-        NSAttributedString(
-            string: "LIVE PiP TEST\nเปิด Camera แล้วข้อความนี้ต้องยังอยู่",
-            attributes: bodyAttributes
-        ).draw(
-            with: CGRect(x: 50, y: 150, width: width - 100, height: 150),
-            options: [.usesLineFragmentOrigin, .usesFontLeading],
-            context: nil
-        )
+                let alpha: CGFloat = offset == 0 ? 1.0 : max(0.42, 0.78 - CGFloat(offset) * 0.12)
+                let weight: UIFont.Weight = offset == 0 ? .semibold : .regular
+
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.systemFont(ofSize: snapshot.fontSize, weight: weight),
+                    .foregroundColor: snapshot.textColor.uiColor.withAlphaComponent(alpha),
+                    .paragraphStyle: paragraph
+                ]
+
+                let attributed = NSAttributedString(string: snapshot.segments[index], attributes: attributes)
+                let y = startY + CGFloat(offset) * blockHeight
+
+                attributed.draw(
+                    with: CGRect(x: 48, y: y, width: CGFloat(width) - 96, height: blockHeight * 1.35),
+                    options: [.usesLineFragmentOrigin, .usesFontLeading],
+                    context: nil
+                )
+            }
+        }
 
         UIGraphicsPopContext()
         context.restoreGState()
@@ -270,8 +779,8 @@ final class TeleprompterVideoView: UIView {
 
         frameCounter += 1
         var timing = CMSampleTimingInfo(
-            duration: CMTime(value: 1, timescale: 2),
-            presentationTimeStamp: CMTime(value: frameCounter, timescale: 2),
+            duration: CMTime(value: 1, timescale: 20),
+            presentationTimeStamp: CMTime(value: frameCounter, timescale: 20),
             decodeTimeStamp: .invalid
         )
 
@@ -317,5 +826,112 @@ final class TeleprompterVideoView: UIView {
         )
 
         return status == kCVReturnSuccess ? buffer : nil
+    }
+}
+
+final class SpeechTracker {
+    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "th-TH"))
+    private let audioEngine = AVAudioEngine()
+    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionTask: SFSpeechRecognitionTask?
+
+    func start(
+        onStatus: @escaping (String) -> Void,
+        onTranscript: @escaping (String) -> Void,
+        onFailure: @escaping (String) -> Void
+    ) {
+        stop()
+
+        requestPermissions { [weak self] allowed, message in
+            guard let self else { return }
+            guard allowed else {
+                onFailure(message)
+                return
+            }
+
+            DispatchQueue.main.async {
+                self.beginRecognition(
+                    onStatus: onStatus,
+                    onTranscript: onTranscript,
+                    onFailure: onFailure
+                )
+            }
+        }
+    }
+
+    func stop() {
+        if audioEngine.isRunning {
+            audioEngine.stop()
+        }
+        audioEngine.inputNode.removeTap(onBus: 0)
+        recognitionRequest?.endAudio()
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        recognitionRequest = nil
+    }
+
+    private func requestPermissions(completion: @escaping (Bool, String) -> Void) {
+        SFSpeechRecognizer.requestAuthorization { speechStatus in
+            guard speechStatus == .authorized else {
+                completion(false, "ไม่ได้รับสิทธิ์ Speech Recognition")
+                return
+            }
+
+            if #available(iOS 17.0, *) {
+                AVAudioApplication.requestRecordPermission { granted in
+                    completion(granted, granted ? "พร้อมใช้ไมโครโฟน" : "ไม่ได้รับสิทธิ์ไมโครโฟน")
+                }
+            } else {
+                AVAudioSession.sharedInstance().requestRecordPermission { granted in
+                    completion(granted, granted ? "พร้อมใช้ไมโครโฟน" : "ไม่ได้รับสิทธิ์ไมโครโฟน")
+                }
+            }
+        }
+    }
+
+    private func beginRecognition(
+        onStatus: @escaping (String) -> Void,
+        onTranscript: @escaping (String) -> Void,
+        onFailure: @escaping (String) -> Void
+    ) {
+        guard let recognizer, recognizer.isAvailable else {
+            onFailure("Speech Recognition ยังไม่พร้อม")
+            return
+        }
+
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playAndRecord, mode: .measurement, options: [.mixWithOthers])
+            try session.setActive(true, options: .notifyOthersOnDeactivation)
+
+            let request = SFSpeechAudioBufferRecognitionRequest()
+            request.shouldReportPartialResults = true
+            recognitionRequest = request
+
+            let inputNode = audioEngine.inputNode
+            let recordingFormat = inputNode.outputFormat(forBus: 0)
+
+            inputNode.removeTap(onBus: 0)
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
+                request.append(buffer)
+            }
+
+            audioEngine.prepare()
+            try audioEngine.start()
+
+            onStatus("Voice กำลังฟังภาษาไทย")
+
+            recognitionTask = recognizer.recognitionTask(with: request) { result, error in
+                if let result {
+                    onTranscript(result.bestTranscription.formattedString)
+                }
+
+                if let error {
+                    onFailure("Voice หยุด: \(error.localizedDescription)")
+                }
+            }
+        } catch {
+            onFailure("เปิดไมโครโฟนไม่ได้: \(error.localizedDescription)")
+        }
     }
 }
