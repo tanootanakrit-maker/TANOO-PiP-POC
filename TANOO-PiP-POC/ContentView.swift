@@ -216,6 +216,16 @@ struct ContentView: View {
                     step: 0.1
                 )
 
+                if teleprompter.mode != .auto {
+                    sliderRow(
+                        title: "Voice Sensitivity",
+                        valueText: "\(Int(teleprompter.voiceSensitivity * 100))%",
+                        value: $teleprompter.voiceSensitivity,
+                        range: 0.35...0.85,
+                        step: 0.05
+                    )
+                }
+
                 sliderRow(
                     title: "ตำแหน่งแนวตั้ง",
                     valueText: "\(Int(teleprompter.verticalPosition * 100))%",
@@ -369,7 +379,7 @@ private struct SavedProjectsView: View {
             }
             .navigationTitle("Saved Projects")
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button("ปิด") { dismiss() }
                 }
             }
