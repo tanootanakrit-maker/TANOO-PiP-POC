@@ -61,15 +61,24 @@ private struct PiPPreview: UIViewRepresentable {
     let controller: PiPController
 
     func makeUIView(context: Context) -> SampleBufferPreviewView {
-        let view = SampleBufferPreviewView()
-        DispatchQueue.main.async {
-            controller.attach(to: view.sampleBufferLayer)
-        }
-        return view
+        SampleBufferPreviewView()
     }
 
     func updateUIView(_ uiView: SampleBufferPreviewView, context: Context) {
         uiView.sampleBufferLayer.frame = uiView.bounds
+
+        // Wait until SwiftUI has actually placed the preview in a visible window.
+        // PiP can remain unavailable if its source layer is configured too early.
+        if uiView.window != nil, uiView.bounds.width > 0, uiView.bounds.height > 0 {
+            controller.attach(to: uiView.sampleBufferLayer)
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                guard uiView.window != nil,
+                      uiView.bounds.width > 0,
+                      uiView.bounds.height > 0 else { return }
+                controller.attach(to: uiView.sampleBufferLayer)
+            }
+        }
     }
 }
 
