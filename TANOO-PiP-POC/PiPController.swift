@@ -8,126 +8,196 @@ import UIKit
 @MainActor
 final class PiPController: NSObject, ObservableObject {
     @Published private(set) var isPictureInPictureActive = false
-    @Published private(set) var canStartPictureInPicture = false
-    @Published private(set) var statusText = "กำลังเตรียม PiP…"
+    @Published private(set) var isControllerReady = false
+    @Published private(set) var isPictureInPicturePossible = false
+    @Published private(set) var statusText = "กำลังเตรียม PiP แบบ Live…"
 
     let isSupported = AVPictureInPictureController.isPictureInPictureSupported()
 
-    private weak var displayLayer: AVSampleBufferDisplayLayer?
+    private weak var sourceView: TeleprompterVideoView?
+    private var pipContentView: TeleprompterVideoView?
+    private var pipVideoCallViewController: AVPictureInPictureVideoCallViewController?
     private var pipController: AVPictureInPictureController?
-    private var possibleObservation: NSKeyValueObservation?
+    private var pipPossibleObservation: NSKeyValueObservation?
     private var renderTimer: Timer?
-    private var frameCounter: Int64 = 0
 
-    func attach(to layer: AVSampleBufferDisplayLayer) {
-        guard displayLayer !== layer else {
-            refreshStatus()
-            return
-        }
-
-        displayLayer = layer
-        layer.videoGravity = .resizeAspect
+    func attach(to sourceView: TeleprompterVideoView) {
+        guard self.sourceView !== sourceView else { return }
+        self.sourceView = sourceView
 
         guard isSupported else {
             statusText = "อุปกรณ์นี้ไม่รองรับ Picture in Picture"
-            canStartPictureInPicture = false
+            isControllerReady = false
             return
         }
 
-        // Apple requires PiP apps to be configured for background media playback.
-        // The plist already contains the background audio mode; activate a playback
-        // audio session here so iOS can mark PiP as possible.
         do {
-            let audio = AVAudioSession.sharedInstance()
-            try audio.setCategory(.playback, mode: .moviePlayback, options: [])
-            try audio.setActive(true)
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
+            try audioSession.setActive(true)
         } catch {
-            statusText = "ตั้งค่าเสียงสำหรับ PiP ไม่สำเร็จ: \(error.localizedDescription)"
+            statusText = "เตรียมระบบ PiP ไม่สมบูรณ์: \(error.localizedDescription)"
         }
 
-        let source = AVPictureInPictureController.ContentSource(
-            sampleBufferDisplayLayer: layer,
-            playbackDelegate: self
+        let pipView = TeleprompterVideoView()
+        pipView.translatesAutoresizingMaskIntoConstraints = false
+        pipView.renderFrame()
+
+        let videoCallVC = AVPictureInPictureVideoCallViewController()
+        videoCallVC.preferredContentSize = CGSize(width: 960, height: 360)
+        videoCallVC.view.backgroundColor = .black
+        videoCallVC.view.addSubview(pipView)
+
+        NSLayoutConstraint.activate([
+            pipView.topAnchor.constraint(equalTo: videoCallVC.view.topAnchor),
+            pipView.leadingAnchor.constraint(equalTo: videoCallVC.view.leadingAnchor),
+            pipView.trailingAnchor.constraint(equalTo: videoCallVC.view.trailingAnchor),
+            pipView.bottomAnchor.constraint(equalTo: videoCallVC.view.bottomAnchor)
+        ])
+
+        let contentSource = AVPictureInPictureController.ContentSource(
+            activeVideoCallSourceView: sourceView,
+            contentViewController: videoCallVC
         )
-        let controller = AVPictureInPictureController(contentSource: source)
+
+        let controller = AVPictureInPictureController(contentSource: contentSource)
         controller.delegate = self
         controller.canStartPictureInPictureAutomaticallyFromInline = false
-        pipController = controller
 
-        // isPictureInPicturePossible is KVO-observable. Observe it instead of
-        // relying only on polling so the button updates immediately when iOS
-        // finishes preparing the content source.
-        possibleObservation = controller.observe(
+        pipContentView = pipView
+        pipVideoCallViewController = videoCallVC
+        pipController = controller
+        isControllerReady = true
+
+        pipPossibleObservation = controller.observe(
             \.isPictureInPicturePossible,
             options: [.initial, .new]
-        ) { [weak self] observed, _ in
-            DispatchQueue.main.async {
+        ) { [weak self] controller, _ in
+            Task { @MainActor in
                 guard let self else { return }
-                self.canStartPictureInPicture = observed.isPictureInPicturePossible
-                self.statusText = observed.isPictureInPicturePossible
-                    ? "พร้อมทดสอบ — กด เปิด PiP แล้วเปิด Camera"
-                    : "กำลังรอให้ PiP พร้อม…"
+                self.isPictureInPicturePossible = controller.isPictureInPicturePossible
+                self.statusText = controller.isPictureInPicturePossible
+                    ? "พร้อมทดสอบ Live PiP — กด เปิด PiP"
+                    : "PiP Controller พร้อมแล้ว กำลังรอระบบอนุญาต…"
             }
         }
 
         startRendering()
-        renderFrame()
-
-        // Give AVSampleBufferDisplayLayer a moment to present its first frame,
-        // then invalidate PiP playback state and re-check availability.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self else { return }
-            self.pipController?.invalidatePlaybackState()
-            self.renderFrame()
-            self.refreshStatus()
-        }
-    }
-
-    func refreshStatus() {
-        guard isSupported else {
-            statusText = "อุปกรณ์นี้ไม่รองรับ Picture in Picture"
-            canStartPictureInPicture = false
-            return
-        }
-
-        canStartPictureInPicture = pipController?.isPictureInPicturePossible ?? false
-        statusText = canStartPictureInPicture
-            ? "พร้อมทดสอบ — กด เปิด PiP แล้วเปิด Camera"
-            : "กำลังรอให้ PiP พร้อม…"
+        statusText = "PiP Controller พร้อมแล้ว กำลังรอระบบอนุญาต…"
     }
 
     func togglePictureInPicture() {
-        guard let pipController else { return }
-        if pipController.isPictureInPictureActive {
-            pipController.stopPictureInPicture()
-        } else if pipController.isPictureInPicturePossible {
-            renderFrame()
-            pipController.startPictureInPicture()
-        } else {
-            refreshStatus()
+        guard let controller = pipController else {
+            statusText = "PiP Controller ยังไม่พร้อม"
+            return
         }
+
+        if controller.isPictureInPictureActive {
+            controller.stopPictureInPicture()
+            return
+        }
+
+        sourceView?.renderFrame()
+        pipContentView?.renderFrame()
+
+        guard controller.isPictureInPicturePossible else {
+            statusText = "PiP ยังไม่พร้อม ลองรอ 1–2 วินาทีแล้วกดอีกครั้ง"
+            return
+        }
+
+        controller.startPictureInPicture()
     }
 
     private func startRendering() {
         renderTimer?.invalidate()
-        renderTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        renderTimer = Timer.scheduledTimer(withTimeInterval: 0.75, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.renderFrame()
-                self?.refreshStatus()
+                self?.sourceView?.renderFrame()
+                self?.pipContentView?.renderFrame()
             }
         }
-        RunLoop.main.add(renderTimer!, forMode: .common)
+        if let renderTimer {
+            RunLoop.main.add(renderTimer, forMode: .common)
+        }
+    }
+}
+
+extension PiPController: AVPictureInPictureControllerDelegate {
+    nonisolated func pictureInPictureControllerWillStartPictureInPicture(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) {
+        Task { @MainActor in
+            self.pipContentView?.renderFrame()
+            self.statusText = "กำลังเปิด Live PiP…"
+        }
     }
 
-    private func renderFrame() {
-        guard let displayLayer else { return }
+    nonisolated func pictureInPictureControllerDidStartPictureInPicture(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) {
+        Task { @MainActor in
+            self.isPictureInPictureActive = true
+            self.pipContentView?.renderFrame()
+            self.statusText = "Live PiP ทำงานแล้ว — เปิด Camera เพื่อทดสอบ"
+        }
+    }
 
+    nonisolated func pictureInPictureControllerDidStopPictureInPicture(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) {
+        Task { @MainActor in
+            self.isPictureInPictureActive = false
+            self.statusText = "PiP หยุดแล้ว"
+        }
+    }
+
+    nonisolated func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        failedToStartPictureInPictureWithError error: Error
+    ) {
+        Task { @MainActor in
+            self.isPictureInPictureActive = false
+            self.statusText = "เปิด Live PiP ไม่สำเร็จ: \(error.localizedDescription)"
+        }
+    }
+
+    nonisolated func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
+    ) {
+        completionHandler(true)
+    }
+}
+
+final class TeleprompterVideoView: UIView {
+    override class var layerClass: AnyClass {
+        AVSampleBufferDisplayLayer.self
+    }
+
+    private var displayLayer: AVSampleBufferDisplayLayer {
+        layer as! AVSampleBufferDisplayLayer
+    }
+
+    private var frameCounter: Int64 = 0
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .black
+        displayLayer.videoGravity = .resizeAspect
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func renderFrame() {
         if displayLayer.status == .failed {
             displayLayer.flush()
         }
 
         let width = 960
-        let height = 540
+        let height = 360
+
         guard let pixelBuffer = makePixelBuffer(width: width, height: height) else { return }
 
         CVPixelBufferLockBaseAddress(pixelBuffer, [])
@@ -146,7 +216,7 @@ final class PiPController: NSObject, ObservableObject {
             )
         else { return }
 
-        context.setFillColor(UIColor.black.withAlphaComponent(0.88).cgColor)
+        context.setFillColor(UIColor.black.cgColor)
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
 
         context.saveGState()
@@ -156,18 +226,34 @@ final class PiPController: NSObject, ObservableObject {
 
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .center
-        paragraph.lineSpacing = 10
+        paragraph.lineSpacing = 8
 
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: UIFont.systemFont(ofSize: 42, weight: .semibold),
+        let titleAttributes: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: 48, weight: .bold),
             .foregroundColor: UIColor.white,
             .paragraphStyle: paragraph
         ]
 
-        let text = "TANOO TELEPROMPTER\nPiP TEST\nเปิด Camera แล้วดูว่ากล่องนี้ยังลอยอยู่หรือไม่"
-        let attributed = NSAttributedString(string: text, attributes: attributes)
-        attributed.draw(
-            with: CGRect(x: 60, y: 110, width: width - 120, height: height - 180),
+        let bodyAttributes: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: 34, weight: .medium),
+            .foregroundColor: UIColor.white,
+            .paragraphStyle: paragraph
+        ]
+
+        NSAttributedString(
+            string: "TANOO TELEPROMPTER",
+            attributes: titleAttributes
+        ).draw(
+            with: CGRect(x: 50, y: 72, width: width - 100, height: 70),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            context: nil
+        )
+
+        NSAttributedString(
+            string: "LIVE PiP TEST\nเปิด Camera แล้วข้อความนี้ต้องยังอยู่",
+            attributes: bodyAttributes
+        ).draw(
+            with: CGRect(x: 50, y: 150, width: width - 100, height: 150),
             options: [.usesLineFragmentOrigin, .usesFontLeading],
             context: nil
         )
@@ -188,8 +274,8 @@ final class PiPController: NSObject, ObservableObject {
             presentationTimeStamp: CMTime(value: frameCounter, timescale: 2),
             decodeTimeStamp: .invalid
         )
-        var sampleBuffer: CMSampleBuffer?
 
+        var sampleBuffer: CMSampleBuffer?
         guard CMSampleBufferCreateReadyWithImageBuffer(
             allocator: kCFAllocatorDefault,
             imageBuffer: pixelBuffer,
@@ -219,6 +305,7 @@ final class PiPController: NSObject, ObservableObject {
             kCVPixelBufferCGBitmapContextCompatibilityKey: true,
             kCVPixelBufferIOSurfacePropertiesKey: [:]
         ]
+
         var buffer: CVPixelBuffer?
         let status = CVPixelBufferCreate(
             kCFAllocatorDefault,
@@ -228,90 +315,7 @@ final class PiPController: NSObject, ObservableObject {
             attributes as CFDictionary,
             &buffer
         )
+
         return status == kCVReturnSuccess ? buffer : nil
-    }
-}
-
-extension PiPController: AVPictureInPictureControllerDelegate {
-    nonisolated func pictureInPictureControllerWillStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
-        Task { @MainActor in
-            self.statusText = "กำลังเปิด PiP…"
-        }
-    }
-
-    nonisolated func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
-        Task { @MainActor in
-            self.isPictureInPictureActive = true
-            self.statusText = "PiP ทำงานแล้ว — เปิด Camera เพื่อทดสอบ"
-        }
-    }
-
-    nonisolated func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
-        Task { @MainActor in
-            self.isPictureInPictureActive = false
-            self.statusText = "PiP หยุดแล้ว"
-            self.refreshStatus()
-        }
-    }
-
-    nonisolated func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        failedToStartPictureInPictureWithError error: Error
-    ) {
-        Task { @MainActor in
-            self.isPictureInPictureActive = false
-            self.statusText = "เปิด PiP ไม่สำเร็จ: \(error.localizedDescription)"
-        }
-    }
-
-    nonisolated func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
-    ) {
-        completionHandler(true)
-    }
-}
-
-extension PiPController: AVPictureInPictureSampleBufferPlaybackDelegate {
-    nonisolated func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        setPlaying playing: Bool
-    ) {
-        Task { @MainActor in
-            self.renderFrame()
-            pictureInPictureController.invalidatePlaybackState()
-        }
-    }
-
-    nonisolated func pictureInPictureControllerTimeRangeForPlayback(
-        _ pictureInPictureController: AVPictureInPictureController
-    ) -> CMTimeRange {
-        CMTimeRange(start: .zero, duration: .positiveInfinity)
-    }
-
-    nonisolated func pictureInPictureControllerIsPlaybackPaused(
-        _ pictureInPictureController: AVPictureInPictureController
-    ) -> Bool {
-        false
-    }
-
-    nonisolated func pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(
-        _ pictureInPictureController: AVPictureInPictureController
-    ) -> Bool {
-        true
-    }
-
-    nonisolated func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        didTransitionToRenderSize newRenderSize: CMVideoDimensions
-    ) {
-    }
-
-    nonisolated func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        skipByInterval skipInterval: CMTime,
-        completion completionHandler: @escaping @Sendable () -> Void
-    ) {
-        completionHandler()
     }
 }
