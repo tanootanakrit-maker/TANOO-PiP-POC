@@ -15,11 +15,16 @@ final class PiPController: NSObject, ObservableObject {
 
     private weak var displayLayer: AVSampleBufferDisplayLayer?
     private var pipController: AVPictureInPictureController?
+    private var possibleObservation: NSKeyValueObservation?
     private var renderTimer: Timer?
     private var frameCounter: Int64 = 0
 
     func attach(to layer: AVSampleBufferDisplayLayer) {
-        guard displayLayer !== layer else { return }
+        guard displayLayer !== layer else {
+            refreshStatus()
+            return
+        }
+
         displayLayer = layer
         layer.videoGravity = .resizeAspect
 
@@ -27,6 +32,17 @@ final class PiPController: NSObject, ObservableObject {
             statusText = "อุปกรณ์นี้ไม่รองรับ Picture in Picture"
             canStartPictureInPicture = false
             return
+        }
+
+        // Apple requires PiP apps to be configured for background media playback.
+        // The plist already contains the background audio mode; activate a playback
+        // audio session here so iOS can mark PiP as possible.
+        do {
+            let audio = AVAudioSession.sharedInstance()
+            try audio.setCategory(.playback, mode: .moviePlayback, options: [])
+            try audio.setActive(true)
+        } catch {
+            statusText = "ตั้งค่าเสียงสำหรับ PiP ไม่สำเร็จ: \(error.localizedDescription)"
         }
 
         let source = AVPictureInPictureController.ContentSource(
@@ -38,9 +54,33 @@ final class PiPController: NSObject, ObservableObject {
         controller.canStartPictureInPictureAutomaticallyFromInline = false
         pipController = controller
 
+        // isPictureInPicturePossible is KVO-observable. Observe it instead of
+        // relying only on polling so the button updates immediately when iOS
+        // finishes preparing the content source.
+        possibleObservation = controller.observe(
+            \.isPictureInPicturePossible,
+            options: [.initial, .new]
+        ) { [weak self] observed, _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.canStartPictureInPicture = observed.isPictureInPicturePossible
+                self.statusText = observed.isPictureInPicturePossible
+                    ? "พร้อมทดสอบ — กด เปิด PiP แล้วเปิด Camera"
+                    : "กำลังรอให้ PiP พร้อม…"
+            }
+        }
+
         startRendering()
         renderFrame()
-        refreshStatus()
+
+        // Give AVSampleBufferDisplayLayer a moment to present its first frame,
+        // then invalidate PiP playback state and re-check availability.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            self.pipController?.contentSource?.invalidatePlaybackState()
+            self.renderFrame()
+            self.refreshStatus()
+        }
     }
 
     func refreshStatus() {
