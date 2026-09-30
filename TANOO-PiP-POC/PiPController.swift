@@ -17,6 +17,7 @@ final class PiPController: NSObject, ObservableObject {
     private var pipController: AVPictureInPictureController?
     private var possibleObservation: NSKeyValueObservation?
     private var renderTimer: Timer?
+    private var pipPossibleObservation: NSKeyValueObservation?
     private var frameCounter: Int64 = 0
 
     func attach(to layer: AVSampleBufferDisplayLayer) {
@@ -43,6 +44,14 @@ final class PiPController: NSObject, ObservableObject {
             try audio.setActive(true)
         } catch {
             statusText = "ตั้งค่าเสียงสำหรับ PiP ไม่สำเร็จ: \(error.localizedDescription)"
+        }
+
+        do {
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(.playback, mode: .moviePlayback, options: [])
+            try audioSession.setActive(true)
+        } catch {
+            statusText = "ตั้งค่า Audio Session ไม่สำเร็จ: \(error.localizedDescription)"
         }
 
         let source = AVPictureInPictureController.ContentSource(
