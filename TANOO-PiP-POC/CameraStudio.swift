@@ -38,7 +38,7 @@ enum CameraResolution: String, CaseIterable, Identifiable {
 final class CameraController: NSObject, ObservableObject {
     let session = AVCaptureSession()
 
-    @Published var captureMode: CameraCaptureMode = .cinematic
+    @Published var captureMode: CameraCaptureMode = .video
     @Published var resolution: CameraResolution = .uhd4K
     @Published var frameRate: Double = 30
 
@@ -303,14 +303,24 @@ final class CameraController: NSObject, ObservableObject {
 
     private func configureSessionIfNeeded() {
         guard !isConfigured else {
-            if !session.isRunning { session.startRunning() }
-            Task { @MainActor in self.isRunning = self.session.isRunning }
+            if !session.isRunning {
+                session.startRunning()
+            }
+            Task { @MainActor in
+                self.isRunning = self.session.isRunning
+            }
             return
         }
 
         session.beginConfiguration()
+        var configurationCommitted = false
+        defer {
+            if !configurationCommitted {
+                session.commitConfiguration()
+            }
+        }
+
         session.sessionPreset = .inputPriority
-        defer { session.commitConfiguration() }
 
         for input in session.inputs {
             session.removeInput(input)
@@ -352,8 +362,13 @@ final class CameraController: NSObject, ObservableObject {
                 session.addOutput(audioDataOutput)
             }
 
-            applyCaptureSettings(manageSessionConfiguration: false)
+            // Important: never call startRunning while between
+            // beginConfiguration() and commitConfiguration().
+            session.commitConfiguration()
+            configurationCommitted = true
 
+            // Apply format/FPS/codec in a separate configuration transaction.
+            applyCaptureSettings()
             updateCapabilities()
 
             if !session.isRunning {
