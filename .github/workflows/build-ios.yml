@@ -1,0 +1,48 @@
+name: Build TANOO PiP POC
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build unsigned app
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project "TANOO-PiP-POC.xcodeproj" \
+            -scheme "TANOO-PiP-POC" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP_PATH="build/Build/Products/Release-iphoneos/TANOO-PiP-POC.app"
+          test -d "$APP_PATH"
+          rm -rf Payload TANOO-PiP-POC-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          ditto -c -k --sequesterRsrc --keepParent Payload TANOO-PiP-POC-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: TANOO-PiP-POC-unsigned-IPA
+          path: TANOO-PiP-POC-unsigned.ipa
+          if-no-files-found: error
