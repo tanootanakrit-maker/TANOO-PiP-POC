@@ -39,7 +39,7 @@ final class CameraController: NSObject, ObservableObject {
     let session = AVCaptureSession()
 
     @Published var captureMode: CameraCaptureMode = .video
-    @Published var resolution: CameraResolution = .uhd4K
+    @Published var resolution: CameraResolution = .hd1080
     @Published var frameRate: Double = 30
 
     @Published private(set) var isConfigured = false
@@ -464,8 +464,7 @@ final class CameraController: NSObject, ObservableObject {
             session.removeOutput(output)
         }
 
-        guard let camera = AVCaptureDevice.default(.builtInTrueDepthCamera, for: .video, position: .front)
-            ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) else {
+        guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) else {
             Task { @MainActor in
                 self.statusText = "ไม่พบกล้องหน้า"
             }
@@ -563,8 +562,7 @@ final class CameraController: NSObject, ObservableObject {
             session.removeOutput(output)
         }
 
-        guard let camera = AVCaptureDevice.default(.builtInTrueDepthCamera, for: .video, position: .front)
-            ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) else {
+        guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) else {
             Task { @MainActor in self.statusText = "ไม่พบกล้องหน้า" }
             return
         }
@@ -1078,104 +1076,329 @@ private struct CameraTeleprompterOverlayView: UIViewRepresentable {
     }
 }
 
+private struct CameraTeleprompterOverlay: UIViewRepresentable {
+    let controller: PiPController
+
+    func makeUIView(context: Context) -> TeleprompterVideoView {
+        let view = TeleprompterVideoView()
+        DispatchQueue.main.async {
+            controller.attachCameraOverlay(view)
+        }
+        return view
+    }
+
+    func updateUIView(_ uiView: TeleprompterVideoView, context: Context) {
+        uiView.render(snapshot: controller.snapshot())
+    }
+}
+
 struct CameraStudioView: View {
     @ObservedObject var camera: CameraController
     @ObservedObject var teleprompter: PiPController
-    @State private var showPreviewLayer = false
+    @State private var cameraStarted = false
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 16) {
-                GroupBox {
-                    ZStack {
-                        Rectangle()
-                            .fill(Color.black)
-                            .aspectRatio(9.0 / 16.0, contentMode: .fit)
+            ZStack {
+                Color.black.ignoresSafeArea()
 
-                        if showPreviewLayer {
-                            CameraPreview(controller: camera)
-                                .aspectRatio(9.0 / 16.0, contentMode: .fit)
-                                .clipped()
-                                .onAppear {
-                                    camera.diagnosticPreviewAttached()
-                                }
-                        } else {
-                            VStack(spacing: 10) {
-                                Image(systemName: "video.fill")
-                                    .font(.system(size: 34))
-                                    .foregroundStyle(.white)
+                VStack(spacing: 0) {
+                    cameraArea
+                    controlArea
+                }
+            }
+            .navigationTitle("TANOO Camera")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarColorScheme(.dark, for: .navigationBar)
+            .onAppear {
+                teleprompter.setUsesExternalSpeech(true)
+                camera.onTranscript = { transcript in
+                    Task { @MainActor in
+                        teleprompter.receiveExternalTranscript(transcript)
+                    }
+                }
+            }
+            .onDisappear {
+                camera.stopSpeech()
+                camera.stop()
+                teleprompter.setUsesExternalSpeech(false)
+                cameraStarted = false
+            }
+            .onChange(of: teleprompter.isRunning) { _ in
+                syncSpeech()
+            }
+            .onChange(of: teleprompter.mode) { _ in
+                syncSpeech()
+            }
+            .onChange(of: camera.resolution) { _ in
+                if cameraStarted { camera.reconfigure() }
+            }
+            .onChange(of: camera.frameRate) { _ in
+                if cameraStarted { camera.reconfigure() }
+            }
+        }
+    }
 
-                                Text("TANOO Camera Diagnostic")
-                                    .foregroundStyle(.white)
-                                    .font(.headline)
+    private var cameraArea: some View {
+        ZStack {
+            if cameraStarted {
+                CameraPreview(controller: camera)
+                    .aspectRatio(9.0 / 16.0, contentMode: .fit)
+                    .clipped()
+            } else {
+                Rectangle()
+                    .fill(Color.black)
+                    .aspectRatio(9.0 / 16.0, contentMode: .fit)
+                    .overlay {
+                        VStack(spacing: 14) {
+                            Image(systemName: "video.fill")
+                                .font(.system(size: 38))
+                                .foregroundStyle(.white)
 
-                                Text("รอบนี้แยกการเปิดกล้องเป็น 4 ขั้น เพื่อรู้ว่าคำสั่งไหนทำให้แอปเด้ง")
-                                    .foregroundStyle(.white.opacity(0.75))
-                                    .font(.caption)
-                                    .multilineTextAlignment(.center)
-                                    .padding(.horizontal, 24)
+                            Text("TANOO Camera")
+                                .font(.headline)
+                                .foregroundStyle(.white)
+
+                            Button("เปิดกล้อง") {
+                                cameraStarted = true
+                                camera.start()
                             }
+                            .buttonStyle(.borderedProminent)
                         }
                     }
-                    .clipShape(RoundedRectangle(cornerRadius: 16))
+            }
+
+            if cameraStarted {
+                VStack(spacing: 0) {
+                    HStack(spacing: 7) {
+                        statusBadge(camera.captureMode.title)
+                        statusBadge(camera.resolution.rawValue)
+                        statusBadge(String(Int(camera.frameRate)) + " FPS")
+                        Spacer()
+                        statusBadge(String(format: "%.1fx", camera.zoomFactor))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.top, 8)
+
+                    CameraTeleprompterOverlay(controller: teleprompter)
+                        .frame(height: 205)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                        .padding(.horizontal, 10)
+                        .padding(.top, 12)
+
+                    Spacer()
+
+                    if camera.isRecording {
+                        Text("● REC  " + formatDuration(camera.recordingSeconds))
+                            .font(.system(.headline, design: .monospaced).bold())
+                            .foregroundStyle(.red)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(.black.opacity(0.72), in: Capsule())
+                            .padding(.bottom, 10)
+                    }
                 }
+            }
+        }
+    }
 
-                VStack(spacing: 10) {
-                    Button("STEP 1 — Detect Front Camera") {
-                        camera.diagnosticDetectFrontCamera()
+    private var controlArea: some View {
+        ScrollView {
+            VStack(spacing: 12) {
+                Picker("Teleprompter Mode", selection: $teleprompter.mode) {
+                    ForEach(TeleprompterMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                HStack(spacing: 8) {
+                    Picker("Resolution", selection: $camera.resolution) {
+                        Text("1080p").tag(CameraResolution.hd1080)
+                        Text("4K").tag(CameraResolution.uhd4K)
+                    }
+                    .pickerStyle(.segmented)
+
+                    Picker("FPS", selection: $camera.frameRate) {
+                        Text("30").tag(30.0)
+                        Text("60").tag(60.0)
+                    }
+                    .pickerStyle(.segmented)
+                }
+                .disabled(!cameraStarted || camera.isRecording)
+
+                slider(
+                    title: "Zoom",
+                    valueText: String(format: "%.1fx", camera.zoomFactor),
+                    value: Binding(
+                        get: { Double(camera.zoomFactor) },
+                        set: { camera.setZoom(CGFloat($0)) }
+                    ),
+                    range: Double(camera.minZoomFactor)...Double(max(camera.maxZoomFactor, camera.minZoomFactor + 0.1))
+                )
+                .disabled(!cameraStarted)
+
+                slider(
+                    title: "Exposure",
+                    valueText: String(format: "%+.1f EV", camera.exposureBias),
+                    value: Binding(
+                        get: { Double(camera.exposureBias) },
+                        set: { camera.setExposureBias(Float($0)) }
+                    ),
+                    range: Double(camera.minExposureBias)...Double(max(camera.maxExposureBias, camera.minExposureBias + 0.1))
+                )
+                .disabled(!cameraStarted)
+
+                HStack(spacing: 8) {
+                    Button {
+                        teleprompter.previous()
+                    } label: {
+                        Label("ย้อน", systemImage: "backward.end.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button {
+                        teleprompter.toggleRunning()
+                        syncSpeech()
+                    } label: {
+                        Label(
+                            teleprompter.isRunning ? "Pause" : "Start",
+                            systemImage: teleprompter.isRunning ? "pause.fill" : "play.fill"
+                        )
+                        .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(camera.diagnosticStage != 0)
 
-                    Button("STEP 2 — Configure Video Session") {
-                        camera.diagnosticConfigureVideoOnly()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(camera.diagnosticStage != 1)
-
-                    Button("STEP 3 — Start Capture Session") {
-                        camera.diagnosticStartSession()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(camera.diagnosticStage != 2)
-
-                    Button("STEP 4 — Attach PreviewLayer") {
-                        showPreviewLayer = true
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(camera.diagnosticStage != 3)
-
-                    Button("Reset Diagnostic") {
-                        showPreviewLayer = false
-                        camera.resetDiagnostic()
+                    Button {
+                        teleprompter.next()
+                    } label: {
+                        Label("ถัดไป", systemImage: "forward.end.fill")
+                            .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
                 }
 
-                GroupBox("สถานะ") {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(camera.statusText)
-                            .font(.subheadline)
-                        Text("Stage: \(camera.diagnosticStage)/4")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Text("ไม่มี Microphone, Recording, Speech, Cinematic, Pro/RAW หรือ Teleprompter overlay ใน diagnostic นี้")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Button {
+                        teleprompter.autoSpeed = max(0.5, teleprompter.autoSpeed - 0.1)
+                    } label: {
+                        Text("Speed −")
+                            .frame(maxWidth: .infinity)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .buttonStyle(.bordered)
+
+                    Button {
+                        camera.toggleFocusExposureLock()
+                    } label: {
+                        Label(
+                            camera.focusExposureLocked ? "AE/AF LOCK" : "Lock",
+                            systemImage: camera.focusExposureLocked ? "lock.fill" : "lock.open"
+                        )
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!cameraStarted)
+
+                    Button {
+                        teleprompter.autoSpeed = min(2.5, teleprompter.autoSpeed + 0.1)
+                    } label: {
+                        Text("Speed +")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
                 }
 
-                Spacer()
+                Button {
+                    if !camera.isRecording && !teleprompter.isRunning {
+                        teleprompter.start()
+                    }
+                    syncSpeech()
+                    camera.toggleRecording()
+                    if camera.isRecording == false && teleprompter.isRunning {
+                        teleprompter.pause()
+                    }
+                } label: {
+                    HStack(spacing: 10) {
+                        Circle()
+                            .fill(camera.isRecording ? Color.white : Color.red)
+                            .frame(width: 22, height: 22)
+
+                        Text(camera.isRecording ? "STOP RECORDING" : "REC")
+                            .font(.headline.bold())
+                    }
+                    .foregroundStyle(camera.isRecording ? .black : .white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Color.red, in: RoundedRectangle(cornerRadius: 14))
+                }
+                .disabled(!cameraStarted || !camera.isConfigured)
+
+                Text(camera.statusText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                if teleprompter.mode != .auto {
+                    Text(teleprompter.speechStatus)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                Text("แตะบนภาพเพื่อโฟกัส • Teleprompter เป็น Overlay บนหน้าจอและไม่ถูกฝังลงในไฟล์วิดีโอ • บรรทัดว่างใน Script จะคงอยู่เป็นจังหวะพูด")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding()
-            .navigationTitle("Camera Diagnostic")
-            .navigationBarTitleDisplayMode(.inline)
-            .onDisappear {
-                showPreviewLayer = false
-                camera.stop()
-            }
+            .padding(12)
         }
+        .background(Color(uiColor: .systemBackground))
+    }
+
+    private func statusBadge(_ text: String) -> some View {
+        Text(text)
+            .font(.caption2.bold())
+            .foregroundStyle(.white)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(.black.opacity(0.7), in: Capsule())
+    }
+
+    private func slider(
+        title: String,
+        valueText: String,
+        value: Binding<Double>,
+        range: ClosedRange<Double>
+    ) -> some View {
+        VStack(spacing: 4) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text(valueText)
+                    .foregroundStyle(.secondary)
+            }
+            .font(.caption)
+            Slider(value: value, in: range)
+        }
+    }
+
+    private func syncSpeech() {
+        guard cameraStarted, camera.isConfigured else {
+            camera.stopSpeech()
+            return
+        }
+
+        if teleprompter.isRunning && teleprompter.mode != .auto {
+            camera.startSpeech()
+        } else {
+            camera.stopSpeech()
+        }
+    }
+
+    private func formatDuration(_ seconds: TimeInterval) -> String {
+        let total = Int(seconds)
+        return String(format: "%02d:%02d", total / 60, total % 60)
     }
 }
 
@@ -1185,14 +1408,14 @@ struct ContentView: View {
 
     var body: some View {
         TabView {
-            TeleprompterSetupView(teleprompter: teleprompter)
-                .tabItem {
-                    Label("Script", systemImage: "text.alignleft")
-                }
-
             CameraStudioView(camera: camera, teleprompter: teleprompter)
                 .tabItem {
                     Label("Camera", systemImage: "video.fill")
+                }
+
+            TeleprompterSetupView(teleprompter: teleprompter)
+                .tabItem {
+                    Label("Script", systemImage: "text.alignleft")
                 }
         }
     }
