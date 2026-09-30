@@ -1,4 +1,6 @@
 import Foundation
+import Combine
+import QuartzCore
 import AVKit
 import AVFoundation
 import CoreMedia
@@ -89,6 +91,7 @@ struct SavedProject: Codable, Identifiable {
     var backgroundOpacity: Double
     var textAlignment: PromptAlignment
     var textColorStyle: PromptTextColor
+    var voiceSensitivity: Double?
     var updatedAt: Date
 }
 
@@ -120,6 +123,7 @@ final class PiPController: NSObject, ObservableObject {
     @Published var fontSize: CGFloat = 44
     @Published var lineSpacing: CGFloat = 10
     @Published var autoSpeed: Double = 1.0
+    @Published var voiceSensitivity: Double = 0.65
     @Published var verticalPosition: Double = 0.18
     @Published var backgroundOpacity: Double = 0.78
     @Published var textAlignment: PromptAlignment = .center
@@ -338,6 +342,7 @@ final class PiPController: NSObject, ObservableObject {
             backgroundOpacity: backgroundOpacity,
             textAlignment: textAlignment,
             textColorStyle: textColorStyle,
+            voiceSensitivity: voiceSensitivity,
             updatedAt: Date()
         )
 
@@ -355,6 +360,7 @@ final class PiPController: NSObject, ObservableObject {
                 backgroundOpacity: project.backgroundOpacity,
                 textAlignment: project.textAlignment,
                 textColorStyle: project.textColorStyle,
+                voiceSensitivity: project.voiceSensitivity,
                 updatedAt: project.updatedAt
             )
             savedProjects[index] = updated
@@ -378,6 +384,7 @@ final class PiPController: NSObject, ObservableObject {
         backgroundOpacity = project.backgroundOpacity
         textAlignment = project.textAlignment
         textColorStyle = project.textColorStyle
+        voiceSensitivity = project.voiceSensitivity ?? 0.65
         rebuildSegments(reset: true)
         modeDidChange()
         statusText = "โหลดโปรเจกต์ “\(project.name)” แล้ว"
@@ -385,7 +392,10 @@ final class PiPController: NSObject, ObservableObject {
     }
 
     func deleteProjects(at offsets: IndexSet) {
-        savedProjects.remove(atOffsets: offsets)
+        for index in offsets.sorted(by: >) {
+            guard savedProjects.indices.contains(index) else { continue }
+            savedProjects.remove(at: index)
+        }
         persistProjects()
     }
 
@@ -491,7 +501,8 @@ final class PiPController: NSObject, ObservableObject {
 
         guard target.count >= 4 else { return }
 
-        let prefixLength = min(max(6, target.count / 3), 18)
+        let evidenceFraction = max(0.18, 0.52 - (voiceSensitivity * 0.36))
+        let prefixLength = min(max(5, Int(Double(target.count) * evidenceFraction)), 18)
         let prefix = String(target.prefix(prefixLength))
 
         let matched = normalizedTranscript.contains(prefix)
@@ -570,7 +581,7 @@ final class PiPController: NSObject, ObservableObject {
 
         var result: [String] = []
         for part in rawParts {
-            result.append(contentsOf: chunk(part, targetLength: 52))
+            result.append(contentsOf: chunk(part, targetLength: 36))
         }
 
         return result.isEmpty ? [""] : result
@@ -834,6 +845,7 @@ final class SpeechTracker {
     private let audioEngine = AVAudioEngine()
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    private var tapInstalled = false
 
     func start(
         onStatus: @escaping (String) -> Void,
@@ -863,7 +875,10 @@ final class SpeechTracker {
         if audioEngine.isRunning {
             audioEngine.stop()
         }
-        audioEngine.inputNode.removeTap(onBus: 0)
+        if tapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
         recognitionRequest?.endAudio()
         recognitionTask?.cancel()
         recognitionTask = nil
@@ -911,10 +926,14 @@ final class SpeechTracker {
             let inputNode = audioEngine.inputNode
             let recordingFormat = inputNode.outputFormat(forBus: 0)
 
-            inputNode.removeTap(onBus: 0)
+            if tapInstalled {
+                inputNode.removeTap(onBus: 0)
+                tapInstalled = false
+            }
             inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
                 request.append(buffer)
             }
+            tapInstalled = true
 
             audioEngine.prepare()
             try audioEngine.start()
