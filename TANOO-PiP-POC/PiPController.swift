@@ -277,18 +277,28 @@ extension PiPController: AVPictureInPictureSampleBufferPlaybackDelegate {
         _ pictureInPictureController: AVPictureInPictureController,
         setPlaying playing: Bool
     ) {
+        Task { @MainActor in
+            self.renderFrame()
+            pictureInPictureController.invalidatePlaybackState()
+        }
     }
 
     nonisolated func pictureInPictureControllerTimeRangeForPlayback(
         _ pictureInPictureController: AVPictureInPictureController
     ) -> CMTimeRange {
-        CMTimeRange(start: .zero, duration: CMTime(seconds: 24 * 60 * 60, preferredTimescale: 600))
+        CMTimeRange(start: .zero, duration: .positiveInfinity)
     }
 
     nonisolated func pictureInPictureControllerIsPlaybackPaused(
         _ pictureInPictureController: AVPictureInPictureController
     ) -> Bool {
         false
+    }
+
+    nonisolated func pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) -> Bool {
+        true
     }
 
     nonisolated func pictureInPictureController(
