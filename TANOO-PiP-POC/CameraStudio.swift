@@ -352,7 +352,7 @@ final class CameraController: NSObject, ObservableObject {
                 session.addOutput(audioDataOutput)
             }
 
-            applyCaptureSettings()
+            applyCaptureSettings(manageSessionConfiguration: false)
 
             updateCapabilities()
 
@@ -372,11 +372,17 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
-    private func applyCaptureSettings() {
+    private func applyCaptureSettings(manageSessionConfiguration: Bool = true) {
         guard let device = currentDevice, let input = videoInput else { return }
 
-        session.beginConfiguration()
-        defer { session.commitConfiguration() }
+        if manageSessionConfiguration {
+            session.beginConfiguration()
+        }
+        defer {
+            if manageSessionConfiguration {
+                session.commitConfiguration()
+            }
+        }
 
         if #available(iOS 26.0, *) {
             if input.isCinematicVideoCaptureEnabled {
@@ -462,6 +468,9 @@ final class CameraController: NSObject, ObservableObject {
         }
         if connection.isVideoMirroringSupported {
             connection.isVideoMirrored = true
+        }
+        if connection.isVideoStabilizationSupported {
+            connection.preferredVideoStabilizationMode = .auto
         }
 
         let available = movieOutput.availableVideoCodecTypes
