@@ -35,7 +35,6 @@ enum CameraResolution: String, CaseIterable, Identifiable {
     }
 }
 
-@MainActor
 final class CameraController: NSObject, ObservableObject {
     let session = AVCaptureSession()
 
@@ -355,7 +354,6 @@ final class CameraController: NSObject, ObservableObject {
 
             applyCaptureSettings()
 
-            isConfigured = true
             updateCapabilities()
 
             if !session.isRunning {
@@ -363,6 +361,7 @@ final class CameraController: NSObject, ObservableObject {
             }
 
             Task { @MainActor in
+                self.isConfigured = true
                 self.isRunning = self.session.isRunning
                 self.statusText = "TANOO Camera พร้อมใช้งาน"
             }
@@ -620,7 +619,7 @@ final class CameraController: NSObject, ObservableObject {
 }
 
 extension CameraController: AVCaptureFileOutputRecordingDelegate {
-    nonisolated func fileOutput(
+    func fileOutput(
         _ output: AVCaptureFileOutput,
         didFinishRecordingTo outputFileURL: URL,
         from connections: [AVCaptureConnection],
@@ -641,7 +640,7 @@ extension CameraController: AVCaptureFileOutputRecordingDelegate {
 }
 
 extension CameraController: AVCaptureAudioDataOutputSampleBufferDelegate {
-    nonisolated func captureOutput(
+    func captureOutput(
         _ output: AVCaptureOutput,
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
@@ -812,7 +811,9 @@ struct CameraStudioView: View {
             .onAppear {
                 teleprompter.setUsesExternalSpeech(true)
                 camera.onTranscript = { transcript in
-                    teleprompter.receiveExternalTranscript(transcript)
+                    Task { @MainActor in
+                        teleprompter.receiveExternalTranscript(transcript)
+                    }
                 }
                 camera.start()
                 syncSpeech()
@@ -1016,7 +1017,7 @@ struct CameraStudioView: View {
                     camera.selectMode(mode)
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(camera.captureMode == mode ? .primary : .secondary)
+                .tint(camera.captureMode == mode ? Color.accentColor : Color.gray)
                 .disabled(!camera.supportsMode(mode))
             }
         }
