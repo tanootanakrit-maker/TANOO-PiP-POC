@@ -20,7 +20,7 @@ struct ContentView: View {
 
                 Text(pip.statusText)
                     .font(.subheadline)
-                    .foregroundStyle(pip.isSupported ? .secondary : .red)
+                    .foregroundStyle(pip.isSupported ? Color.secondary : Color.red)
                     .multilineTextAlignment(.center)
 
                 Button {
