@@ -1224,6 +1224,44 @@ final class PiPController: NSObject, ObservableObject {
     }
 
 
+    private func advanceOneSegment(source: String) {
+        guard !segments.isEmpty else { return }
+
+        if currentIndex < segments.count - 1 {
+            currentIndex += 1
+            progress = 0
+            segmentStartTime = CACurrentMediaTime()
+            lastMatchedTranscript = ""
+
+            if source == "voice" {
+                statusText = mode == .hybrid
+                    ? "Hybrid: Voice จับบรรทัดถัดไป"
+                    : "Voice: จับบรรทัดถัดไป"
+            }
+        } else {
+            progress = 0
+            segmentStartTime = CACurrentMediaTime()
+            isRunning = false
+            speechTracker.stop()
+            statusText = "จบสคริปต์"
+        }
+
+        renderViews()
+    }
+
+    private func rebuildSegments(reset: Bool) {
+        let oldIndex = currentIndex
+        segments = segmentScript(scriptText)
+
+        if reset {
+            currentIndex = 0
+            progress = 0
+            segmentStartTime = CACurrentMediaTime()
+        } else {
+            currentIndex = min(oldIndex, max(segments.count - 1, 0))
+        }
+    }
+
     private static func splitSentencesPreservingText(_ text: String) -> [String] {
         var result: [String] = []
         var buffer = ""
