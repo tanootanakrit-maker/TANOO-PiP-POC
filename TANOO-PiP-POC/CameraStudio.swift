@@ -474,6 +474,11 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
+    private var cinematicCaptureEnabled: Bool {
+        if #available(iOS 26.0, *) { return videoInput?.isCinematicVideoCaptureEnabled ?? false }
+        return false
+    }
+
     func toggleFocusExposureLock() {
         focusExposureLocked.toggle()
         let shouldLock = focusExposureLocked
@@ -483,7 +488,7 @@ final class CameraController: NSObject, ObservableObject {
             do {
                 try device.lockForConfiguration()
 
-                if self.captureMode == .cinematic {
+                if self.cinematicCaptureEnabled {
                     if #available(iOS 26.0, *) {
                         device.setCinematicVideoTrackingFocus(
                             at: CGPoint(x: 0.5, y: 0.5),
@@ -522,7 +527,7 @@ final class CameraController: NSObject, ObservableObject {
             do {
                 try device.lockForConfiguration()
 
-                if self.captureMode == .cinematic {
+                if self.cinematicCaptureEnabled {
                     if #available(iOS 26.0, *) {
                         device.setCinematicVideoTrackingFocus(
                             at: CGPoint(x: 0.5, y: 0.5),
@@ -566,7 +571,7 @@ final class CameraController: NSObject, ObservableObject {
             do {
                 try device.lockForConfiguration()
 
-                if self.captureMode == .cinematic {
+                if self.cinematicCaptureEnabled {
                     if #available(iOS 26.0, *) {
                         device.setCinematicVideoTrackingFocus(at: devicePoint, focusMode: .strong)
                     }
@@ -610,7 +615,7 @@ final class CameraController: NSObject, ObservableObject {
             do {
                 try device.lockForConfiguration()
 
-                if self.captureMode == .cinematic {
+                if self.cinematicCaptureEnabled {
                     if #available(iOS 26.0, *) {
                         device.setCinematicVideoFixedFocus(at: devicePoint, focusMode: .strong)
                     }
@@ -632,7 +637,7 @@ final class CameraController: NSObject, ObservableObject {
 
                 device.unlockForConfiguration()
 
-                if self.captureMode != .cinematic {
+                if !self.cinematicCaptureEnabled {
                     self.sessionQueue.asyncAfter(deadline: .now() + 0.45) { [weak self] in
                         guard let self, self.focusExposureLocked, let device = self.currentDevice else { return }
                         do {
@@ -2666,7 +2671,9 @@ struct CameraStudioView: View {
                             .stroke(.white, lineWidth: 5)
                             .frame(width: 78, height: 78)
 
-                        if camera.isRecording || camera.isPaused {
+                        if countdownRemaining != nil {
+                            Circle().fill(Color.orange).frame(width: 62, height: 62)
+                        } else if camera.isRecording || camera.isPaused {
                             RoundedRectangle(cornerRadius: 7)
                                 .fill(Color.red)
                                 .frame(width: 34, height: 34)
@@ -2685,9 +2692,8 @@ struct CameraStudioView: View {
                 .disabled(!shutterEnabled)
                 .opacity(shutterEnabled ? 1 : 0.45)
                 .accessibilityLabel(
-                    camera.isRecording || camera.isPaused
-                        ? "Stop Recording"
-                        : "Start Recording"
+                    countdownRemaining != nil ? "Cancel Countdown" :
+                        (camera.isRecording || camera.isPaused ? "Stop Recording" : "Start Recording")
                 )
             }
             .frame(height: 82)
