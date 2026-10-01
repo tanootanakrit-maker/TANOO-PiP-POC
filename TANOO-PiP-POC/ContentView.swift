@@ -227,7 +227,7 @@ struct TeleprompterSetupView: View {
                     title: "ขนาดตัวอักษร",
                     valueText: "\(Int(teleprompter.fontSize))",
                     value: $teleprompter.fontSize,
-                    range: 28...68,
+                    range: 12...68,
                     step: 1
                 )
 
