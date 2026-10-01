@@ -1582,6 +1582,7 @@ struct CameraPreview: UIViewRepresentable {
         @objc func didTap(_ gesture: UITapGestureRecognizer) {
             guard let view = previewView else { return }
             let point = gesture.location(in: view)
+            view.showFocusIndicator(at: point, locked: false)
             let devicePoint = view.previewLayer.captureDevicePointConverted(fromLayerPoint: point)
             controller.focus(at: devicePoint)
         }
@@ -1589,6 +1590,7 @@ struct CameraPreview: UIViewRepresentable {
         @objc func didLongPress(_ gesture: UILongPressGestureRecognizer) {
             guard gesture.state == .began, let view = previewView else { return }
             let point = gesture.location(in: view)
+            view.showFocusIndicator(at: point, locked: true)
             let devicePoint = view.previewLayer.captureDevicePointConverted(fromLayerPoint: point)
             controller.lockFocus(at: devicePoint)
         }
@@ -1597,6 +1599,7 @@ struct CameraPreview: UIViewRepresentable {
 
 final class PreviewView: UIView {
     let previewLayer = AVCaptureVideoPreviewLayer()
+    private var focusIndicator: UIView?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -1621,6 +1624,53 @@ final class PreviewView: UIView {
         precondition(Thread.isMainThread)
         if previewLayer.session !== session {
             previewLayer.session = session
+        }
+    }
+
+    func showFocusIndicator(at point: CGPoint, locked: Bool) {
+        focusIndicator?.removeFromSuperview()
+
+        let box = UIView(frame: CGRect(x: 0, y: 0, width: 68, height: 68))
+        box.center = point
+        box.backgroundColor = .clear
+        box.layer.borderColor = UIColor.systemYellow.cgColor
+        box.layer.borderWidth = locked ? 2.2 : 1.6
+        box.layer.cornerRadius = 5
+        box.isUserInteractionEnabled = false
+
+        if locked {
+            let label = UILabel(frame: CGRect(x: -22, y: 72, width: 112, height: 22))
+            label.text = "AE/AF LOCK"
+            label.textAlignment = .center
+            label.textColor = .systemYellow
+            label.font = .systemFont(ofSize: 11, weight: .semibold)
+            label.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+            label.layer.cornerRadius = 6
+            label.clipsToBounds = true
+            box.addSubview(label)
+        }
+
+        addSubview(box)
+        focusIndicator = box
+        box.transform = CGAffineTransform(scaleX: 1.25, y: 1.25)
+        box.alpha = 0
+
+        UIView.animate(withDuration: 0.18, animations: {
+            box.alpha = 1
+            box.transform = .identity
+        }) { _ in
+            UIView.animate(
+                withDuration: 0.32,
+                delay: locked ? 1.25 : 0.75,
+                options: [.curveEaseOut]
+            ) {
+                box.alpha = 0
+            } completion: { [weak self, weak box] _ in
+                box?.removeFromSuperview()
+                if self?.focusIndicator === box {
+                    self?.focusIndicator = nil
+                }
+            }
         }
     }
 }
