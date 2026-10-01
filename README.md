@@ -25,3 +25,6 @@ Native iPhone teleprompter that uses Apple's Live Picture in Picture so the prom
 The Live PiP architecture is used because playback-style PiP is paused by Apple Camera on the tested device. Live PiP does not expose arbitrary custom interactive controls inside the floating system window. Detailed controls remain in the main app.
 
 Voice Follow and Hybrid request microphone access. When Apple Camera is actively recording video, iOS may take exclusive control of the microphone. Hybrid is designed to continue Auto scrolling when Voice becomes unavailable. Auto mode does not require the microphone.
+
+
+v2.9 final validation: Voice Focus, focus reticle, AF Auto, Apple-style shutter, pause/resume segments, temp-file safety.
