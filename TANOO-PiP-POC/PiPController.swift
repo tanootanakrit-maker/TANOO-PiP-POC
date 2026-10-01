@@ -144,6 +144,8 @@ final class PiPController: NSObject, ObservableObject {
     private var segments: [String] = []
     private var progress: Double = 0
     private var lastTick = CACurrentMediaTime()
+    private var segmentStartTime = CACurrentMediaTime()
+    private var settingsCancellables = Set<AnyCancellable>()
 
     private weak var sourceView: TeleprompterVideoView?
     private weak var cameraOverlayView: TeleprompterVideoView?
@@ -161,8 +163,10 @@ final class PiPController: NSObject, ObservableObject {
 
     override init() {
         super.init()
+        loadCurrentSettings()
         rebuildSegments(reset: true)
         loadSavedProjects()
+        observeCurrentSettings()
         startEngineTimer()
     }
 
@@ -316,7 +320,9 @@ final class PiPController: NSObject, ObservableObject {
             return
         }
         isRunning = true
-        lastTick = CACurrentMediaTime()
+        let now = CACurrentMediaTime()
+        lastTick = now
+        segmentStartTime = now - progress * currentLineDuration()
         configureSpeechForCurrentMode()
         statusText = "กำลังทำงาน: \(mode.title)"
         renderViews()
@@ -336,6 +342,7 @@ final class PiPController: NSObject, ObservableObject {
     func previous() {
         currentIndex = max(0, currentIndex - 1)
         progress = 0
+        segmentStartTime = CACurrentMediaTime()
         lastMatchedTranscript = ""
         renderViews()
     }
@@ -347,6 +354,7 @@ final class PiPController: NSObject, ObservableObject {
     func resetPosition() {
         currentIndex = 0
         progress = 0
+        segmentStartTime = CACurrentMediaTime()
         lastMatchedTranscript = ""
         renderViews()
     }
@@ -425,6 +433,150 @@ final class PiPController: NSObject, ObservableObject {
         persistProjects()
     }
 
+    private enum CurrentSettingKey {
+        static let projectName = "TANOO.current.projectName"
+        static let scriptText = "TANOO.current.scriptText"
+        static let mode = "TANOO.current.mode"
+        static let fontSize = "TANOO.current.fontSize"
+        static let lineSpacing = "TANOO.current.lineSpacing"
+        static let autoSpeed = "TANOO.current.autoSpeed"
+        static let voiceSensitivity = "TANOO.current.voiceSensitivity"
+        static let verticalPosition = "TANOO.current.verticalPosition"
+        static let backgroundOpacity = "TANOO.current.backgroundOpacity"
+        static let alignment = "TANOO.current.alignment"
+        static let textColor = "TANOO.current.textColor"
+    }
+
+    private func loadCurrentSettings() {
+        let defaults = UserDefaults.standard
+
+        if let value = defaults.string(forKey: CurrentSettingKey.projectName), !value.isEmpty {
+            projectName = value
+        }
+        if let value = defaults.string(forKey: CurrentSettingKey.scriptText) {
+            scriptText = value
+        }
+        if let raw = defaults.string(forKey: CurrentSettingKey.mode),
+           let value = TeleprompterMode(rawValue: raw) {
+            mode = value
+        }
+        if defaults.object(forKey: CurrentSettingKey.fontSize) != nil {
+            fontSize = CGFloat(defaults.double(forKey: CurrentSettingKey.fontSize))
+        }
+        if defaults.object(forKey: CurrentSettingKey.lineSpacing) != nil {
+            lineSpacing = CGFloat(defaults.double(forKey: CurrentSettingKey.lineSpacing))
+        }
+        if defaults.object(forKey: CurrentSettingKey.autoSpeed) != nil {
+            autoSpeed = defaults.double(forKey: CurrentSettingKey.autoSpeed)
+        }
+        if defaults.object(forKey: CurrentSettingKey.voiceSensitivity) != nil {
+            voiceSensitivity = defaults.double(forKey: CurrentSettingKey.voiceSensitivity)
+        }
+        if defaults.object(forKey: CurrentSettingKey.verticalPosition) != nil {
+            verticalPosition = defaults.double(forKey: CurrentSettingKey.verticalPosition)
+        }
+        if defaults.object(forKey: CurrentSettingKey.backgroundOpacity) != nil {
+            backgroundOpacity = defaults.double(forKey: CurrentSettingKey.backgroundOpacity)
+        }
+        if let raw = defaults.string(forKey: CurrentSettingKey.alignment),
+           let value = PromptAlignment(rawValue: raw) {
+            textAlignment = value
+        }
+        if let raw = defaults.string(forKey: CurrentSettingKey.textColor),
+           let value = PromptTextColor(rawValue: raw) {
+            textColorStyle = value
+        }
+    }
+
+    private func observeCurrentSettings() {
+        let defaults = UserDefaults.standard
+
+        $projectName
+            .dropFirst()
+            .sink { defaults.set($0, forKey: CurrentSettingKey.projectName) }
+            .store(in: &settingsCancellables)
+
+        $scriptText
+            .dropFirst()
+            .debounce(for: .milliseconds(350), scheduler: RunLoop.main)
+            .sink { [weak self] value in
+                defaults.set(value, forKey: CurrentSettingKey.scriptText)
+                self?.rebuildSegments(reset: false)
+                self?.renderViews()
+            }
+            .store(in: &settingsCancellables)
+
+        $mode
+            .dropFirst()
+            .sink { defaults.set($0.rawValue, forKey: CurrentSettingKey.mode) }
+            .store(in: &settingsCancellables)
+
+        $fontSize
+            .dropFirst()
+            .sink { [weak self] value in
+                defaults.set(Double(value), forKey: CurrentSettingKey.fontSize)
+                self?.rebuildSegments(reset: false)
+                self?.progress = 0
+                self?.segmentStartTime = CACurrentMediaTime()
+                self?.renderViews()
+            }
+            .store(in: &settingsCancellables)
+
+        $lineSpacing
+            .dropFirst()
+            .sink { [weak self] value in
+                defaults.set(Double(value), forKey: CurrentSettingKey.lineSpacing)
+                self?.renderViews()
+            }
+            .store(in: &settingsCancellables)
+
+        $autoSpeed
+            .dropFirst()
+            .sink { [weak self] value in
+                defaults.set(value, forKey: CurrentSettingKey.autoSpeed)
+                guard let self else { return }
+                self.segmentStartTime = CACurrentMediaTime() - self.progress * self.currentLineDuration()
+            }
+            .store(in: &settingsCancellables)
+
+        $voiceSensitivity
+            .dropFirst()
+            .sink { defaults.set($0, forKey: CurrentSettingKey.voiceSensitivity) }
+            .store(in: &settingsCancellables)
+
+        $verticalPosition
+            .dropFirst()
+            .sink { [weak self] value in
+                defaults.set(value, forKey: CurrentSettingKey.verticalPosition)
+                self?.renderViews()
+            }
+            .store(in: &settingsCancellables)
+
+        $backgroundOpacity
+            .dropFirst()
+            .sink { [weak self] value in
+                defaults.set(value, forKey: CurrentSettingKey.backgroundOpacity)
+                self?.renderViews()
+            }
+            .store(in: &settingsCancellables)
+
+        $textAlignment
+            .dropFirst()
+            .sink { [weak self] value in
+                defaults.set(value.rawValue, forKey: CurrentSettingKey.alignment)
+                self?.renderViews()
+            }
+            .store(in: &settingsCancellables)
+
+        $textColorStyle
+            .dropFirst()
+            .sink { [weak self] value in
+                defaults.set(value.rawValue, forKey: CurrentSettingKey.textColor)
+                self?.renderViews()
+            }
+            .store(in: &settingsCancellables)
+    }
+
     private func loadSavedProjects() {
         guard let data = UserDefaults.standard.data(forKey: projectsKey),
               let projects = try? JSONDecoder().decode([SavedProject].self, from: data) else {
@@ -450,9 +602,14 @@ final class PiPController: NSObject, ObservableObject {
         }
     }
 
+    private func currentLineDuration() -> Double {
+        // Every script line — including an intentionally blank line — uses
+        // exactly the same duration. This removes speed changes caused by text length.
+        max(0.65, 3.4 / max(autoSpeed, 0.1))
+    }
+
     private func tick() {
         let now = CACurrentMediaTime()
-        let delta = max(0, min(now - lastTick, 0.25))
         lastTick = now
 
         if isRunning && !segments.isEmpty {
@@ -461,22 +618,15 @@ final class PiPController: NSObject, ObservableObject {
             let shouldAutoAdvance = mode == .auto || mode == .hybrid || isBlankLine
 
             if shouldAutoAdvance {
-                let duration: Double
-                if isBlankLine {
-                    // A real empty script line is kept on screen as breathing/pacing space.
-                    duration = max(0.55, 0.9 / max(autoSpeed, 0.5))
-                } else {
-                    let charCount = max(12, current.count)
-                    duration = max(1.0, Double(charCount) / (11.0 * autoSpeed))
-                }
+                let duration = currentLineDuration()
+                var elapsed = max(0, now - segmentStartTime)
 
-                progress += delta / duration
-
-                while progress >= 1.0 {
-                    progress -= 1.0
+                while elapsed >= duration {
                     if currentIndex < segments.count - 1 {
                         currentIndex += 1
                         lastMatchedTranscript = ""
+                        segmentStartTime += duration
+                        elapsed = max(0, now - segmentStartTime)
                     } else {
                         progress = 0
                         isRunning = false
@@ -485,6 +635,13 @@ final class PiPController: NSObject, ObservableObject {
                         break
                     }
                 }
+
+                if isRunning {
+                    progress = min(max(elapsed / duration, 0), 0.999)
+                }
+            } else {
+                progress = 0
+                segmentStartTime = now
             }
         }
 
@@ -633,12 +790,14 @@ final class PiPController: NSObject, ObservableObject {
         if currentIndex < segments.count - 1 {
             currentIndex += 1
             progress = 0
+            segmentStartTime = CACurrentMediaTime()
             lastMatchedTranscript = ""
             if source == "voice" {
                 statusText = mode == .hybrid ? "Hybrid: Voice ข้ามไปช่วงถัดไป" : "Voice: ไปช่วงถัดไป"
             }
         } else {
             progress = 0
+            segmentStartTime = CACurrentMediaTime()
             isRunning = false
             speechTracker.stop()
             statusText = "จบสคริปต์"
@@ -649,7 +808,7 @@ final class PiPController: NSObject, ObservableObject {
 
     private func rebuildSegments(reset: Bool) {
         let oldIndex = currentIndex
-        segments = Self.segmentScript(scriptText)
+        segments = segmentScript(scriptText)
 
         if reset {
             currentIndex = 0
@@ -659,7 +818,7 @@ final class PiPController: NSObject, ObservableObject {
         }
     }
 
-    private static func segmentScript(_ script: String) -> [String] {
+    private func segmentScript(_ script: String) -> [String] {
         let normalized = script
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
@@ -668,6 +827,8 @@ final class PiPController: NSObject, ObservableObject {
         // teleprompter segment. This preserves the user's speaking rhythm.
         let lines = normalized.components(separatedBy: "\n")
         var result: [String] = []
+
+        let targetLength = max(12, min(88, Int(30.0 * (44.0 / max(Double(fontSize), 12.0)))))
 
         for line in lines {
             let trimmedLine = line.trimmingCharacters(in: .whitespaces)
@@ -703,7 +864,7 @@ final class PiPController: NSObject, ObservableObject {
             }
 
             for part in sentenceParts {
-                result.append(contentsOf: chunk(part, targetLength: 36))
+                result.append(contentsOf: chunk(part, targetLength: targetLength))
             }
         }
 
