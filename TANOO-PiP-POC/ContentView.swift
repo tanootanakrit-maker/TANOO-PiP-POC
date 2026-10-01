@@ -121,13 +121,35 @@ struct TeleprompterSetupView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 12))
 
                 HStack {
-                    Text("ช่วงข้อความ \(min(teleprompter.currentIndex + 1, max(teleprompter.segmentCount, 1)))/\(max(teleprompter.segmentCount, 1))")
+                    Button {
+                        scriptEditorFocused = false
+                        teleprompter.autoFormatScriptLines()
+                    } label: {
+                        Label("Auto แบ่งบรรทัด", systemImage: "text.line.first.and.arrowtriangle.forward")
+                    }
+                    .buttonStyle(.borderedProminent)
+
                     Spacer()
+
                     Button("ไปต้นสคริปต์") {
                         teleprompter.resetPosition()
                     }
                 }
                 .font(.caption)
+
+                Text("Auto แบ่งบรรทัดจะจัดประโยคและขึ้นบรรทัดใหม่ตามความยาว โดยไม่แก้คำ ตัวเลข หรือเครื่องหมายในสคริปต์")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                HStack {
+                    Text("ช่วงข้อความ \(min(teleprompter.currentIndex + 1, max(teleprompter.segmentCount, 1)))/\(max(teleprompter.segmentCount, 1))")
+                    Spacer()
+                    if !teleprompter.exportStatus.isEmpty {
+                        Text(teleprompter.exportStatus)
+                    }
+                }
+                .font(.caption2)
                 .foregroundStyle(.secondary)
             }
         } label: {
@@ -323,7 +345,7 @@ struct TeleprompterSetupView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Text("Hybrid: Auto ทำงานเป็นฐาน และ Voice จะข้ามไปช่วงถัดไปทันทีเมื่อตรวจพบว่าพูดถึงช่วงปัจจุบันแล้ว หาก Camera ใช้ไมโครโฟนจน Voice หยุด Auto จะยังทำงานต่อ")
+                Text("Voice/Hybrid: รองรับตัวเลขในสคริปต์ เช่น 2 พัน / 2,000 / สองพัน และยอมให้พูดต่างจากสคริปต์เล็กน้อยได้ หากพูดเร็วกว่าข้อความ ระบบจะ Catch-up เฉพาะเมื่อจับประโยคถัดไปได้ชัด")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
