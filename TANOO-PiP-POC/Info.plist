@@ -17,10 +17,12 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>3.1</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>31</string>
     <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>NSCameraPortraitEffectEnabled</key>
     <true/>
     <key>NSCameraUsageDescription</key>
     <string>TANOO Camera ใช้กล้องหน้าเพื่อถ่ายวิดีโอพร้อม Teleprompter</string>

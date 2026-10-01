@@ -2,6 +2,8 @@ name: Build TANOO Teleprompter
 
 on:
   workflow_dispatch:
+  push:
+    branches: [codex/camera-v3.1]
 
 jobs:
   build:
@@ -12,6 +14,9 @@ jobs:
 
       - name: Show Xcode version
         run: xcodebuild -version
+
+      - name: Verify camera geometry and countdown rules
+        run: python3 tests/run_camera_checks.py
 
       - name: Build unsigned app
         run: |

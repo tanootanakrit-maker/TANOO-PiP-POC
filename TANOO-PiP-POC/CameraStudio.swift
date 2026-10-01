@@ -35,6 +35,24 @@ enum CameraResolution: String, CaseIterable, Identifiable {
     }
 }
 
+// BEGIN CAMERA GEOMETRY
+private enum CameraGeometry {
+    static func exportTransform(naturalSize: CGSize, preferred: CGAffineTransform, target: CGSize) -> CGAffineTransform {
+        let bounds = CGRect(origin: .zero, size: naturalSize).applying(preferred)
+        let scale = min(target.width / bounds.width, target.height / bounds.height)
+        return preferred
+            .concatenating(CGAffineTransform(translationX: -bounds.minX, y: -bounds.minY))
+            .concatenating(CGAffineTransform(scaleX: scale, y: scale))
+            .concatenating(CGAffineTransform(translationX: (target.width - bounds.width * scale) / 2,
+                                           y: (target.height - bounds.height * scale) / 2))
+    }
+
+    static func countdown(configured: Int, resuming: Bool) -> Int {
+        resuming ? max(3, configured) : max(0, configured)
+    }
+}
+// END CAMERA GEOMETRY
+
 private enum RecordingStopAction {
     case finish
     case pause
@@ -64,6 +82,14 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var availableDiskGB: Double = 0
     @Published private(set) var recordPreflightMessage: String = ""
 
+    @Published private(set) var isFinishingSegment = false
+    @Published private(set) var isSaving = false
+    @Published private(set) var completedShotCount = 0
+    @Published private(set) var lastShotSeconds: Double = 0
+    @Published private(set) var cameraPosition: AVCaptureDevice.Position = .front
+    @Published private(set) var previewRevision = 0
+    @Published private(set) var portraitSupported = false
+    @Published private(set) var portraitActive = false
     @Published private(set) var cinematicAvailable = false
     @Published private(set) var proAvailable = false
     @Published private(set) var rawAvailable = false
@@ -82,6 +108,13 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var maxSimulatedAperture: Float = 16
 
     var onTranscript: ((String) -> Void)?
+    var onRestorePrompt: ((PiPController.RecordingCheckpoint) -> Void)?
+    var checkpointProvider: (() -> PiPController.RecordingCheckpoint)?
+    private var pendingCheckpoint: PiPController.RecordingCheckpoint?
+    private var shotCheckpoints: [PiPController.RecordingCheckpoint?] = []
+    private var shotDurations: [Double] = []
+    private var portraitObservation: NSKeyValueObservation?
+    private var openPortraitControlsWhenReady = false
 
     private let sessionQueue = DispatchQueue(label: "com.tanoo.camera.session")
     private let audioQueue = DispatchQueue(label: "com.tanoo.camera.audio")
@@ -297,7 +330,7 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func reconfigure() {
-        guard isConfigured, !isRecording, !isStartingRecording, !isReconfiguring else { return }
+        guard isConfigured, !isRecording, !isPaused, !isStartingRecording, !isReconfiguring, !isFinishingSegment, !isSaving else { return }
 
         isReconfiguring = true
         statusText = "กำลังเปลี่ยนคุณภาพกล้อง…"
@@ -318,12 +351,75 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func selectMode(_ mode: CameraCaptureMode) {
+        guard !isRecording, !isPaused, !isStartingRecording, !isReconfiguring,
+              !isFinishingSegment, !isSaving else { return }
         guard supportsMode(mode) else {
             statusText = mode.title + " ไม่รองรับกับกล้อง/Format ปัจจุบัน"
             return
         }
         captureMode = mode
         reconfigure()
+    }
+
+    func openPortraitControls() {
+        guard !isRecording, !isPaused, !isStartingRecording, !isReconfiguring,
+              !isFinishingSegment, !isSaving else { return }
+        guard cameraPosition == .front else {
+            statusText = "สลับเป็นกล้องหน้าก่อนเปิด Portrait"
+            return
+        }
+        // Portrait is controlled by the user, not by a writable app toggle.
+        // Select a supported 1080p30 format before opening Apple's controls.
+        isReconfiguring = true
+        captureMode = .video
+        resolution = .hd1080
+        frameRate = 30
+        openPortraitControlsWhenReady = true
+        sessionQueue.async { [weak self] in self?.applyCaptureSettings() }
+    }
+
+    func switchCamera() {
+        guard isConfigured, !isRecording, !isStartingRecording, !isReconfiguring,
+              !isFinishingSegment, !isSaving else { return }
+        let target: AVCaptureDevice.Position = cameraPosition == .front ? .back : .front
+        isReconfiguring = true
+        stopSpeech()
+        sessionQueue.async { [weak self] in
+            guard let self, let oldInput = self.videoInput else { return }
+            guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: target),
+                  let newInput = try? AVCaptureDeviceInput(device: device) else {
+                Task { @MainActor in
+                    self.isReconfiguring = false
+                    self.statusText = "ไม่พบกล้องที่ต้องการ"
+                }
+                return
+            }
+            self.session.beginConfiguration()
+            self.session.removeInput(oldInput)
+            let changed = self.session.canAddInput(newInput)
+            if changed {
+                self.session.addInput(newInput)
+                self.videoInput = newInput
+                self.currentDevice = device
+            } else {
+                self.session.addInput(oldInput)
+            }
+            self.session.commitConfiguration()
+            guard changed else {
+                Task { @MainActor in
+                    self.isReconfiguring = false
+                    self.statusText = "สลับกล้องไม่ได้ — คงกล้องเดิม"
+                }
+                return
+            }
+            Task { @MainActor in
+                self.cameraPosition = target
+                self.captureMode = .video
+                self.zoomFactor = 1
+                self.focusExposureLocked = false
+                self.sessionQueue.async { self.applyCaptureSettings() }
+            }
+        }
     }
 
     func setZoom(_ value: CGFloat) {
@@ -538,7 +634,7 @@ final class CameraController: NSObject, ObservableObject {
 
                 if self.captureMode != .cinematic {
                     self.sessionQueue.asyncAfter(deadline: .now() + 0.45) { [weak self] in
-                        guard let self, let device = self.currentDevice else { return }
+                        guard let self, self.focusExposureLocked, let device = self.currentDevice else { return }
                         do {
                             try device.lockForConfiguration()
                             if device.isFocusModeSupported(.locked) {
@@ -582,7 +678,7 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func startNewTake() {
-        guard !isRecording, !isStartingRecording, !isReconfiguring else {
+        guard !isRecording, !isPaused, !isStartingRecording, !isReconfiguring, !isFinishingSegment, !isSaving else {
             let message = isReconfiguring
                 ? "REC ยังไม่เริ่ม: กล้องกำลังเปลี่ยนคุณภาพ"
                 : "REC ยังไม่เริ่ม: กล้องยังไม่พร้อม"
@@ -612,6 +708,11 @@ final class CameraController: NSObject, ObservableObject {
 
         recordPreflightMessage = ""
         recordingSegments.removeAll()
+        shotCheckpoints.removeAll()
+        shotDurations.removeAll()
+        completedShotCount = 0
+        lastShotSeconds = 0
+        pendingCheckpoint = checkpointProvider?()
         currentRecordingURL = nil
         recordingSeconds = 0
         isPaused = false
@@ -644,15 +745,23 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func pauseRecording() {
-        guard movieOutput.isRecording else { return }
+        guard isRecording, !isFinishingSegment else { return }
+        isFinishingSegment = true
         stopAction = .pause
-        statusText = "กำลัง Pause…"
-        movieOutput.stopRecording()
+        statusText = "กำลังเก็บช็อต…"
+        sessionQueue.async { self.movieOutput.stopRecording() }
     }
 
     func resumeRecording() {
-        guard isPaused, !isRecording, !isStartingRecording, !isReconfiguring else { return }
-
+        guard isPaused, !isRecording, !isStartingRecording, !isReconfiguring,
+              !isFinishingSegment, !isSaving else { return }
+        refreshDiskSpace()
+        let minimumGB = resolution == .uhd4K ? 2.0 : 1.0
+        guard freeDiskSpaceGB() >= minimumGB else {
+            recordPreflightMessage = "พื้นที่ไม่พอบันทึกต่อ — ช็อตเดิมยังอยู่ กด Stop เพื่อบันทึก"
+            return
+        }
+        pendingCheckpoint = checkpointProvider?()
         isPaused = false
         stopAction = .finish
         resetDurationOnNextSegment = false
@@ -668,6 +777,7 @@ final class CameraController: NSObject, ObservableObject {
             guard self.session.isRunning else {
                 Task { @MainActor in
                     self.isStartingRecording = false
+                    self.isPaused = true
                     self.recordPreflightMessage = "บันทึกต่อไม่ได้: Capture Session ไม่ทำงาน"
                     self.statusText = self.recordPreflightMessage
                 }
@@ -678,13 +788,36 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
+    func deleteLastShot() {
+        guard isPaused, !isFinishingSegment, !isStartingRecording, !isReconfiguring,
+              !isSaving, let url = recordingSegments.last else { return }
+        do {
+            try FileManager.default.removeItem(at: url)
+        } catch {
+            statusText = "ลบช็อตไม่สำเร็จ: " + error.localizedDescription
+            return
+        }
+        recordingSegments.removeLast()
+        let checkpoint = shotCheckpoints.removeLast()
+        shotDurations.removeLast()
+        completedShotCount = recordingSegments.count
+        lastShotSeconds = shotDurations.last ?? 0
+        recordingSeconds = shotDurations.reduce(0, +)
+        if let checkpoint { onRestorePrompt?(checkpoint) }
+        // Stay paused even after deleting the first/only shot, allowing a retake.
+        statusText = "ลบช็อตล่าสุดแล้ว • สคริปต์ย้อนจุดเริ่มช็อต • กด ▶ ถ่ายใหม่"
+        refreshDiskSpace()
+    }
+
     func finishRecording() {
+        guard !isSaving, !isFinishingSegment, !isStartingRecording, !isReconfiguring else { return }
         stopSpeech()
 
-        if movieOutput.isRecording {
+        if isRecording {
+            isFinishingSegment = true
             stopAction = .finish
             statusText = "กำลังหยุดและรวมคลิป…"
-            movieOutput.stopRecording()
+            sessionQueue.async { self.movieOutput.stopRecording() }
         } else if isPaused {
             isPaused = false
             finalizeRecordingSegments()
@@ -953,6 +1086,18 @@ final class CameraController: NSObject, ObservableObject {
             do {
                 try device.lockForConfiguration()
 
+                if openPortraitControlsWhenReady {
+                    let supported = device.formats.first { format in
+                        let d = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+                        return d.width == 1920 && d.height == 1080 && format.isPortraitEffectSupported &&
+                            format.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }
+                    }
+                    if let supported {
+                        session.sessionPreset = .inputPriority
+                        device.activeFormat = supported
+                    }
+                }
+                device.videoZoomFactor = min(max(zoomFactor, device.minAvailableVideoZoomFactor), device.maxAvailableVideoZoomFactor)
                 let ranges = device.activeFormat.videoSupportedFrameRateRanges
                 let requestedSupported = ranges.contains {
                     selectedFPS >= $0.minFrameRate && selectedFPS <= $0.maxFrameRate
@@ -984,7 +1129,8 @@ final class CameraController: NSObject, ObservableObject {
                 configurationMessage = "ตั้งค่า FPS ไม่สำเร็จ: " + error.localizedDescription
             }
         } else {
-            // Advanced modes keep format-specific capability checks.
+            // Explicit formats require inputPriority rather than a preset overriding them.
+            session.sessionPreset = .inputPriority
             let dimensions = resolution.dimensions
             let candidates = device.formats.filter { format in
                 let d = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
@@ -1047,6 +1193,16 @@ final class CameraController: NSObject, ObservableObject {
             self.frameRate = selectedFPS
             self.isRunning = self.session.isRunning
             self.isReconfiguring = false
+            self.previewRevision += 1
+            if self.openPortraitControlsWhenReady {
+                self.openPortraitControlsWhenReady = false
+                if device.activeFormat.isPortraitEffectSupported {
+                    AVCaptureDevice.showSystemUserInterface(.videoEffects)
+                } else {
+                    self.statusText = "กล้องนี้ไม่รองรับ Portrait ในรูปแบบ 1080p30"
+                    return
+                }
+            }
 
             if let configurationMessage, !configurationMessage.isEmpty {
                 self.statusText = configurationMessage
@@ -1064,10 +1220,10 @@ final class CameraController: NSObject, ObservableObject {
         }
         if connection.isVideoMirroringSupported {
             connection.automaticallyAdjustsVideoMirroring = false
-            connection.isVideoMirrored = true
+            connection.isVideoMirrored = currentDevice?.position == .front
         }
         if connection.isVideoStabilizationSupported {
-            connection.preferredVideoStabilizationMode = .auto
+            connection.preferredVideoStabilizationMode = .off
         }
 
         let available = movieOutput.availableVideoCodecTypes
@@ -1106,6 +1262,10 @@ final class CameraController: NSObject, ObservableObject {
     private func updateCapabilities() {
         guard let device = currentDevice else { return }
 
+        portraitObservation = device.observe(\.isPortraitEffectActive, options: [.initial, .new]) { [weak self] device, _ in
+            Task { @MainActor in self?.portraitActive = device.isPortraitEffectActive }
+        }
+        let portrait = device.formats.contains { $0.isPortraitEffectSupported }
         let availableCodecs = movieOutput.availableVideoCodecTypes
 
         var cine = false
@@ -1142,6 +1302,7 @@ final class CameraController: NSObject, ObservableObject {
         }
 
         Task { @MainActor in
+            self.portraitSupported = portrait
             self.cinematicAvailable = cine
             self.proAvailable = pro
             self.rawAvailable = raw
@@ -1209,6 +1370,7 @@ final class CameraController: NSObject, ObservableObject {
         guard !movieOutput.isRecording, !isReconfiguring, session.isRunning else {
             Task { @MainActor in
                 self.isStartingRecording = false
+                self.isPaused = !self.resetDurationOnNextSegment || !self.recordingSegments.isEmpty
                 self.recordPreflightMessage = self.isReconfiguring
                     ? "REC ยังไม่เริ่ม: รอเปลี่ยนคุณภาพกล้องให้เสร็จก่อน"
                     : "REC ยังไม่เริ่ม: กล้องยังไม่พร้อมบันทึก"
@@ -1238,142 +1400,128 @@ final class CameraController: NSObject, ObservableObject {
 
     private func finalizeRecordingSegments() {
         guard !recordingSegments.isEmpty else {
-            statusText = "ไม่มีคลิปสำหรับบันทึก"
+            statusText = "ไม่มีช็อตเหลือสำหรับบันทึก • เริ่มถ่ายใหม่ได้"
+            completedShotCount = 0
             return
         }
-
+        isSaving = true
         recordingTimer?.invalidate()
         recordingTimer = nil
-
         if recordingSegments.count == 1, let url = recordingSegments.first {
-            recordingSegments.removeAll()
-            statusText = "กำลังบันทึกลง Photos…"
             saveVideoToPhotos(url)
             return
         }
-
-        statusText = "กำลังรวมช่วงวิดีโอ…"
-
+        statusText = "กำลังรวมช็อต… กรุณารอ"
         let segments = recordingSegments
         let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("TANOO-MERGED-" + UUID().uuidString)
-            .appendingPathExtension("mov")
-
+            .appendingPathComponent("TANOO-MERGED-" + UUID().uuidString + ".mov")
+        let renderSize = resolution == .uhd4K ? CGSize(width: 2160, height: 3840) : CGSize(width: 1080, height: 1920)
+        let fps = Int32(frameRate)
         sessionQueue.async { [weak self] in
             guard let self else { return }
-
             let composition = AVMutableComposition()
-            guard let videoTrack = composition.addMutableTrack(
-                withMediaType: .video,
-                preferredTrackID: kCMPersistentTrackID_Invalid
-            ) else {
-                Task { @MainActor in
-                    self.statusText = "รวมคลิปไม่สำเร็จ: สร้าง Video Track ไม่ได้"
-                }
+            guard let videoTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid),
+                  let audioTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+                Task { @MainActor in self.exportFailed("สร้างแทร็กไม่ได้") }
                 return
             }
-
-            let audioTrack = composition.addMutableTrack(
-                withMediaType: .audio,
-                preferredTrackID: kCMPersistentTrackID_Invalid
-            )
-
             var cursor = CMTime.zero
-            var preferredTransform: CGAffineTransform?
-
+            var instructions: [AVMutableVideoCompositionInstruction] = []
             do {
                 for url in segments {
                     let asset = AVURLAsset(url: url)
-                    guard let sourceVideo = asset.tracks(withMediaType: .video).first else { continue }
-                    let duration = asset.duration
-                    let range = CMTimeRange(start: .zero, duration: duration)
-
-                    try videoTrack.insertTimeRange(range, of: sourceVideo, at: cursor)
-                    if preferredTransform == nil {
-                        preferredTransform = sourceVideo.preferredTransform
+                    guard let source = asset.tracks(withMediaType: .video).first else {
+                        throw NSError(domain: "TANOO", code: 2001, userInfo: [NSLocalizedDescriptionKey: "ช็อตไม่มีวิดีโอ"])
                     }
-
-                    if let sourceAudio = asset.tracks(withMediaType: .audio).first,
-                       let audioTrack {
-                        try audioTrack.insertTimeRange(range, of: sourceAudio, at: cursor)
+                    let range = source.timeRange
+                    try videoTrack.insertTimeRange(range, of: source, at: cursor)
+                    if let audio = asset.tracks(withMediaType: .audio).first {
+                        let overlap = CMTimeRangeGetIntersection(range, audio.timeRange)
+                        if overlap.duration > .zero {
+                            try audioTrack.insertTimeRange(overlap, of: audio,
+                                at: CMTimeAdd(cursor, CMTimeSubtract(overlap.start, range.start)))
+                        }
                     }
-
-                    cursor = CMTimeAdd(cursor, duration)
+                    let transform = CameraGeometry.exportTransform(naturalSize: source.naturalSize,
+                                                                   preferred: source.preferredTransform,
+                                                                   target: renderSize)
+                    let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: videoTrack)
+                    layer.setTransform(transform, at: cursor)
+                    let instruction = AVMutableVideoCompositionInstruction()
+                    instruction.timeRange = CMTimeRange(start: cursor, duration: range.duration)
+                    instruction.layerInstructions = [layer]
+                    instructions.append(instruction)
+                    cursor = CMTimeAdd(cursor, range.duration)
                 }
-
-                if let preferredTransform {
-                    videoTrack.preferredTransform = preferredTransform
+                let videoComposition = AVMutableVideoComposition()
+                videoComposition.renderSize = renderSize
+                videoComposition.frameDuration = CMTime(value: 1, timescale: max(1, fps))
+                videoComposition.instructions = instructions
+                guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
+                    throw NSError(domain: "TANOO", code: 2002, userInfo: [NSLocalizedDescriptionKey: "สร้างระบบรวมช็อตไม่ได้"])
                 }
-
-                guard let exporter = AVAssetExportSession(
-                    asset: composition,
-                    presetName: AVAssetExportPresetPassthrough
-                ) else {
-                    throw NSError(
-                        domain: "TANOO",
-                        code: 2001,
-                        userInfo: [NSLocalizedDescriptionKey: "สร้างระบบรวมวิดีโอไม่ได้"]
-                    )
-                }
-
+                exporter.videoComposition = videoComposition
                 exporter.outputURL = outputURL
                 exporter.outputFileType = .mov
-                exporter.shouldOptimizeForNetworkUse = false
-
-                exporter.exportAsynchronously { [weak self] in
-                    guard let self else { return }
-
-                    if exporter.status == .completed {
-                        for url in segments {
-                            try? FileManager.default.removeItem(at: url)
-                        }
-
-                        Task { @MainActor in
-                            self.recordingSegments.removeAll()
-                            self.statusText = "รวมคลิปแล้ว กำลังบันทึกลง Photos…"
+                exporter.exportAsynchronously {
+                    Task { @MainActor in
+                        if exporter.status == .completed {
                             self.saveVideoToPhotos(outputURL)
-                        }
-                    } else {
-                        let message = exporter.error?.localizedDescription ?? "Unknown export error"
-                        Task { @MainActor in
-                            self.statusText = "รวมคลิปไม่สำเร็จ: " + message
+                        } else {
+                            try? FileManager.default.removeItem(at: outputURL)
+                            self.exportFailed(exporter.error?.localizedDescription ?? "รวมช็อตไม่สำเร็จ")
                         }
                     }
                 }
             } catch {
-                Task { @MainActor in
-                    self.statusText = "รวมคลิปไม่สำเร็จ: " + error.localizedDescription
-                }
+                Task { @MainActor in self.exportFailed(error.localizedDescription) }
             }
         }
     }
 
+    private func exportFailed(_ message: String) {
+        isSaving = false
+        isPaused = !recordingSegments.isEmpty
+        statusText = message + " • ช็อตยังอยู่ กด Stop เพื่อลองบันทึกอีกครั้ง"
+        recordPreflightMessage = statusText
+    }
+
     private func saveVideoToPhotos(_ url: URL) {
+        statusText = "กำลังบันทึกลง Photos…"
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
+            guard let self else { return }
             guard status == .authorized || status == .limited else {
-                try? FileManager.default.removeItem(at: url)
-                self?.refreshDiskSpace()
                 Task { @MainActor in
-                    self?.statusText = "วิดีโอถ่ายสำเร็จ แต่ไม่ได้รับสิทธิ์บันทึกลง Photos"
+                    if !self.recordingSegments.contains(url) { try? FileManager.default.removeItem(at: url) }
+                    self.exportFailed("กรุณาอนุญาตให้เพิ่มวิดีโอใน Photos ที่การตั้งค่า")
                 }
                 return
             }
-
             PHPhotoLibrary.shared().performChanges({
                 PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
             }) { success, error in
                 Task { @MainActor in
                     if success {
-                        self?.statusText = "บันทึกวิดีโอลง Photos แล้ว"
+                        for segment in self.recordingSegments { try? FileManager.default.removeItem(at: segment) }
+                        try? FileManager.default.removeItem(at: url)
+                        self.recordingSegments.removeAll()
+                        self.shotCheckpoints.removeAll()
+                        self.shotDurations.removeAll()
+                        self.completedShotCount = 0
+                        self.lastShotSeconds = 0
+                        self.isSaving = false
+                        self.recordPreflightMessage = ""
+                        self.statusText = "บันทึกวิดีโอลง Photos แล้ว"
                     } else {
-                        self?.statusText = "บันทึก Photos ไม่สำเร็จ: " + (error?.localizedDescription ?? "Unknown error")
+                        if !self.recordingSegments.contains(url) { try? FileManager.default.removeItem(at: url) }
+                        self.exportFailed(error?.localizedDescription ?? "บันทึก Photos ไม่สำเร็จ")
                     }
+                    self.refreshDiskSpace()
                 }
-                try? FileManager.default.removeItem(at: url)
-                self?.refreshDiskSpace()
             }
         }
     }
+
 }
 
 extension CameraController: AVCaptureFileOutputRecordingDelegate {
@@ -1400,7 +1548,9 @@ extension CameraController: AVCaptureFileOutputRecordingDelegate {
             self.recordingTimer?.invalidate()
             self.recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
                 Task { @MainActor in
-                    self?.recordingSeconds += 0.25
+                    guard let self else { return }
+                    let current = CMTimeGetSeconds(self.movieOutput.recordedDuration)
+                    self.recordingSeconds = self.shotDurations.reduce(0, +) + (current.isFinite ? max(0, current) : 0)
                 }
             }
         }
@@ -1414,20 +1564,31 @@ extension CameraController: AVCaptureFileOutputRecordingDelegate {
     ) {
         Task { @MainActor in
             self.isStartingRecording = false
+            self.isFinishingSegment = false
             self.isRecording = false
             self.recordingTimer?.invalidate()
             self.recordingTimer = nil
 
             self.currentRecordingURL = nil
 
-            if let error {
+            let nsError = error as NSError?
+            let finishedSuccessfully = error == nil || (nsError?.userInfo[AVErrorRecordingSuccessfullyFinishedKey] as? Bool == true)
+            if !finishedSuccessfully, let error {
                 try? FileManager.default.removeItem(at: outputFileURL)
                 self.refreshDiskSpace()
-                self.isPaused = !self.recordingSegments.isEmpty
+                self.isPaused = true
+                self.recordingSeconds = self.shotDurations.reduce(0, +)
+                if let checkpoint = self.pendingCheckpoint { self.onRestorePrompt?(checkpoint) }
                 self.recordPreflightMessage = "REC ERROR: " + error.localizedDescription
                 self.statusText = self.recordPreflightMessage
             } else {
                 self.recordingSegments.append(outputFileURL)
+                self.shotCheckpoints.append(self.pendingCheckpoint)
+                let duration = CMTimeGetSeconds(AVURLAsset(url: outputFileURL).duration)
+                self.shotDurations.append(duration.isFinite ? max(0, duration) : 0)
+                self.recordingSeconds = self.shotDurations.reduce(0, +)
+                self.completedShotCount = self.recordingSegments.count
+                self.lastShotSeconds = self.shotDurations.last ?? 0
 
                 switch self.stopAction {
                 case .pause:
@@ -1468,130 +1629,82 @@ extension CameraController: AVCaptureAudioDataOutputSampleBufferDelegate {
 final class CameraSpeechBridge {
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "th-TH"))
     private let lock = NSLock()
-
-    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-    private var recognitionTask: SFSpeechRecognitionTask?
-    private var active = false
-    private var restarting = false
-
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+    private var generation = UUID()
+    private var wantsSpeech = false
     private var statusHandler: ((String) -> Void)?
     private var transcriptHandler: ((String) -> Void)?
 
-    func start(
-        onStatus: @escaping (String) -> Void,
-        onTranscript: @escaping (String) -> Void
-    ) {
-        lock.lock()
+    func start(onStatus: @escaping (String) -> Void, onTranscript: @escaping (String) -> Void) {
+        // Calls from the controller occur on main; recognition and audio callbacks do not.
+        guard !wantsSpeech else { return }
+        wantsSpeech = true
+        generation = UUID()
+        let token = generation
         statusHandler = onStatus
         transcriptHandler = onTranscript
-        lock.unlock()
-
         SFSpeechRecognizer.requestAuthorization { [weak self] status in
-            guard let self else { return }
-            guard status == .authorized else {
-                onStatus("ไม่ได้รับสิทธิ์ Speech Recognition")
-                return
+            DispatchQueue.main.async {
+                guard let self, self.wantsSpeech, self.generation == token else { return }
+                guard status == .authorized else {
+                    self.wantsSpeech = false
+                    onStatus("ไม่ได้รับสิทธิ์ Speech Recognition")
+                    return
+                }
+                self.begin(token: token)
             }
-
-            self.beginRecognitionIfPossible()
         }
     }
 
-    private func beginRecognitionIfPossible() {
+    private func begin(token: UUID) {
+        guard wantsSpeech, generation == token, let recognizer, recognizer.isAvailable else { return }
+        let next = SFSpeechAudioBufferRecognitionRequest()
+        next.shouldReportPartialResults = true
+        next.taskHint = .dictation
         lock.lock()
-        if active || restarting {
-            lock.unlock()
-            return
-        }
-        restarting = true
-        let onStatus = statusHandler
-        let onTranscript = transcriptHandler
+        request = next
         lock.unlock()
-
-        guard let recognizer, recognizer.isAvailable else {
-            lock.lock()
-            restarting = false
-            lock.unlock()
-            onStatus?("Speech Recognition ยังไม่พร้อม")
-            return
-        }
-
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        request.taskHint = .dictation
-
-        lock.lock()
-        recognitionRequest = request
-        active = true
-        restarting = false
-        lock.unlock()
-
-        recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            guard let self else { return }
-
-            if let result {
-                onTranscript?(result.bestTranscription.formattedString)
-
-                if result.isFinal {
-                    self.restartSoon(reason: "Voice ต่อช่วงการฟังอัตโนมัติ")
+        task = recognizer.recognitionTask(with: next) { [weak self] result, error in
+            DispatchQueue.main.async {
+                guard let self, self.wantsSpeech, self.generation == token else { return }
+                if let result { self.transcriptHandler?(result.bestTranscription.formattedString) }
+                if result?.isFinal == true || error != nil {
+                    // Invalidate this recognition before cancellation can invoke its callback again.
+                    self.generation = UUID()
+                    let nextToken = self.generation
+                    self.clearRecognition()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                        self?.begin(token: nextToken)
+                    }
                 }
             }
-
-            if error != nil {
-                self.restartSoon(reason: "Voice กำลังเชื่อมต่อใหม่…")
-            }
         }
-
-        onStatus?("Voice กำลังฟังภาษาไทย")
-    }
-
-    private func restartSoon(reason: String) {
-        lock.lock()
-        guard active else {
-            lock.unlock()
-            return
-        }
-
-        active = false
-        recognitionRequest?.endAudio()
-        recognitionTask?.cancel()
-        recognitionRequest = nil
-        recognitionTask = nil
-        let onStatus = statusHandler
-        lock.unlock()
-
-        onStatus?(reason)
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-            self?.beginRecognitionIfPossible()
-        }
+        statusHandler?("Voice กำลังฟังภาษาไทย")
     }
 
     func append(_ sampleBuffer: CMSampleBuffer) {
         lock.lock()
-        let request = active ? recognitionRequest : nil
-        lock.unlock()
-
         request?.appendAudioSampleBuffer(sampleBuffer)
+        lock.unlock()
+    }
+
+    private func clearRecognition() {
+        lock.lock()
+        let old = request
+        request = nil
+        lock.unlock()
+        old?.endAudio()
+        task?.cancel()
+        task = nil
     }
 
     func stop() {
-        lock.lock()
-        active = false
-        restarting = false
-
-        let request = recognitionRequest
-        recognitionRequest = nil
-
-        let task = recognitionTask
-        recognitionTask = nil
-
+        wantsSpeech = false
+        generation = UUID()
+        clearRecognition()
         statusHandler = nil
         transcriptHandler = nil
-        lock.unlock()
-
-        request?.endAudio()
-        task?.cancel()
     }
 }
 
@@ -1618,6 +1731,9 @@ struct CameraPreview: UIViewRepresentable {
         )
         tap.require(toFail: longPress)
 
+        let pan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.didPan(_:)))
+        pan.maximumNumberOfTouches = 1
+        view.addGestureRecognizer(pan)
         view.addGestureRecognizer(longPress)
         view.addGestureRecognizer(tap)
         context.coordinator.previewView = view
@@ -1631,6 +1747,7 @@ struct CameraPreview: UIViewRepresentable {
         // was attached. Let AVCaptureVideoPreviewLayer manage front-camera
         // mirroring automatically for this diagnostic.
         uiView.setSession(controller.session)
+        uiView.configureConnection(revision: controller.previewRevision, mirrored: controller.cameraPosition == .front)
     }
 
     static func dismantleUIView(_ uiView: PreviewView, coordinator: Coordinator) {
@@ -1640,6 +1757,24 @@ struct CameraPreview: UIViewRepresentable {
     final class Coordinator: NSObject {
         let controller: CameraController
         weak var previewView: PreviewView?
+        private var exposureStart: Float = 0
+
+        @objc func didPan(_ gesture: UIPanGestureRecognizer) {
+            guard let view = previewView else { return }
+            if gesture.state == .began {
+                exposureStart = controller.exposureBias
+                let point = gesture.location(in: view)
+                if !controller.focusExposureLocked {
+                    controller.focus(at: view.previewLayer.captureDevicePointConverted(fromLayerPoint: point))
+                }
+            }
+            if gesture.state == .began || gesture.state == .changed {
+                let delta = Float(-gesture.translation(in: view).y / max(1, view.bounds.height))
+                let bias = exposureStart + delta * (controller.maxExposureBias - controller.minExposureBias)
+                controller.setExposureBias(bias)
+                view.showExposureIndicator(value: controller.exposureBias)
+            }
+        }
 
         init(controller: CameraController) {
             self.controller = controller
@@ -1666,12 +1801,23 @@ struct CameraPreview: UIViewRepresentable {
 final class PreviewView: UIView {
     let previewLayer = AVCaptureVideoPreviewLayer()
     private var focusIndicator: UIView?
+    private let exposureLabel = UILabel()
+    private var connectionRevision = -1
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
-        previewLayer.videoGravity = .resizeAspectFill
+        previewLayer.videoGravity = .resizeAspect
         layer.addSublayer(previewLayer)
+        exposureLabel.textColor = .systemYellow
+        exposureLabel.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+        exposureLabel.textAlignment = .center
+        exposureLabel.font = .monospacedDigitSystemFont(ofSize: 17, weight: .semibold)
+        exposureLabel.layer.cornerRadius = 12
+        exposureLabel.clipsToBounds = true
+        exposureLabel.isUserInteractionEnabled = false
+        exposureLabel.alpha = 0
+        addSubview(exposureLabel)
     }
 
     required init?(coder: NSCoder) {
@@ -1683,13 +1829,32 @@ final class PreviewView: UIView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         previewLayer.frame = bounds
+        exposureLabel.frame = CGRect(x: max(8, bounds.width - 112), y: bounds.height * 0.48, width: 104, height: 40)
         CATransaction.commit()
+    }
+
+    func showExposureIndicator(value: Float) {
+        exposureLabel.layer.removeAllAnimations()
+        exposureLabel.text = String(format: "☀︎ %+.1f", value)
+        exposureLabel.alpha = 1
+        UIView.animate(withDuration: 0.3, delay: 2, options: [.beginFromCurrentState]) { self.exposureLabel.alpha = 0 }
+    }
+
+    func configureConnection(revision: Int, mirrored: Bool) {
+        guard connectionRevision != revision, let connection = previewLayer.connection else { return }
+        if connection.isVideoOrientationSupported { connection.videoOrientation = .portrait }
+        if connection.isVideoMirroringSupported {
+            connection.automaticallyAdjustsVideoMirroring = false
+            connection.isVideoMirrored = mirrored
+        }
+        connectionRevision = revision
     }
 
     func setSession(_ session: AVCaptureSession?) {
         precondition(Thread.isMainThread)
         if previewLayer.session !== session {
             previewLayer.session = session
+            connectionRevision = -1
         }
     }
 
@@ -1704,6 +1869,10 @@ final class PreviewView: UIView {
         box.layer.cornerRadius = 5
         box.isUserInteractionEnabled = false
 
+        let sun = UILabel(frame: CGRect(x: 72, y: 16, width: 30, height: 36))
+        sun.text = "☀︎"
+        sun.textColor = .systemYellow
+        box.addSubview(sun)
         if locked {
             let label = UILabel(frame: CGRect(x: -22, y: 72, width: 112, height: 22))
             label.text = "AE/AF LOCK"
@@ -1956,7 +2125,7 @@ struct CameraStudioView: View {
     var onOpenScript: (() -> Void)? = nil
 
     @State private var cameraStarted = false
-    @AppStorage("TANOO.camera.controlsExpanded") private var controlsExpanded = true
+    @AppStorage("TANOO.camera.controlsExpanded.v31") private var controlsExpanded = false
     @AppStorage("TANOO.camera.countdownSeconds") private var countdownSeconds = 3
     @State private var countdownRemaining: Int?
     @State private var countdownToken = UUID()
@@ -1966,8 +2135,13 @@ struct CameraStudioView: View {
             Color.black.ignoresSafeArea()
 
             if cameraStarted {
-                CameraPreview(controller: camera)
-                    .ignoresSafeArea()
+                GeometryReader { geometry in
+                    let width = min(geometry.size.width, max(1, geometry.size.height - 140) * 9 / 16)
+                    CameraPreview(controller: camera)
+                        .frame(width: width, height: width * 16 / 9)
+                        .overlay(Rectangle().stroke(.white.opacity(0.25), lineWidth: 1))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                }
             } else {
                 launchCameraView
             }
@@ -2009,6 +2183,8 @@ struct CameraStudioView: View {
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
             teleprompter.setUsesExternalSpeech(true)
+            camera.checkpointProvider = { teleprompter.recordingCheckpoint() }
+            camera.onRestorePrompt = { checkpoint in teleprompter.restoreRecordingCheckpoint(checkpoint) }
             camera.onTranscript = { transcript in
                 Task { @MainActor in
                     teleprompter.receiveExternalTranscript(transcript)
@@ -2144,6 +2320,7 @@ struct CameraStudioView: View {
                 Label("เครื่องมือ", systemImage: "chevron.up")
             }
         }
+        .disabled(activeTake)
         .foregroundStyle(.white)
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
@@ -2170,6 +2347,25 @@ struct CameraStudioView: View {
                         Label("ซ่อน", systemImage: "chevron.down")
                     }
                 }
+
+                HStack {
+                    ForEach(CameraCaptureMode.allCases) { mode in
+                        Button(mode.title) { camera.selectMode(mode) }
+                            .font(.caption.bold())
+                            .foregroundStyle(camera.captureMode == mode ? .yellow : .white)
+                            .disabled(activeTake || !camera.supportsMode(mode) || camera.isReconfiguring)
+                    }
+                    Spacer()
+                    Text("v3.1").font(.caption2)
+                }
+                if camera.captureMode == .cinematic {
+                    slider(title: "Cinematic เบลอ", valueText: String(format: "f/%.1f", camera.simulatedAperture),
+                           value: Binding(get: { Double(camera.simulatedAperture) }, set: { camera.setAperture(Float($0)) }),
+                           range: Double(camera.minSimulatedAperture)...Double(camera.maxSimulatedAperture))
+                        .disabled(activeTake)
+                }
+                Text("Portrait กล้องหน้าใช้ 1080p30 • เปิด/ปิดในแผงเอฟเฟ็กต์ของ iOS • CINE / PRO / RAW แสดงตามที่กล้องรองรับ")
+                    .font(.caption2).foregroundStyle(.secondary)
 
                 Picker("Mode", selection: $teleprompter.mode) {
                     ForEach(TeleprompterMode.allCases) { mode in
@@ -2331,7 +2527,7 @@ struct CameraStudioView: View {
                         .frame(maxWidth: .infinity)
                 }
 
-                Text("แตะภาพ 1 ครั้ง = Focus • กดค้าง = AE/AF LOCK • กด AF AUTO เพื่อกลับเป็น Continuous Auto Focus")
+                Text("แตะภาพ = Focus • ลากขึ้น/ลงบนภาพ = เพิ่ม/ลดแสง • กดค้าง = AE/AF LOCK • AF AUTO = ปลดล็อก")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -2350,6 +2546,7 @@ struct CameraStudioView: View {
             }
             .padding(11)
         }
+        .disabled(activeTake)
         .frame(maxHeight: 370)
         .background(.ultraThinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 18))
@@ -2360,6 +2557,38 @@ struct CameraStudioView: View {
         VStack(spacing: 7) {
             recordInfoBar
                 .foregroundStyle(.white)
+                .padding(.horizontal, 14)
+
+            HStack(spacing: 16) {
+                Button { camera.switchCamera() } label: {
+                    Label(camera.cameraPosition == .front ? "กล้องหน้า" : "กล้องหลัง", systemImage: "arrow.triangle.2.circlepath.camera")
+                }
+                .disabled(camera.isRecording || camera.isStartingRecording || camera.isFinishingSegment || camera.isSaving || camera.isReconfiguring || countdownRemaining != nil)
+                Spacer()
+                Button { camera.openPortraitControls() } label: {
+                    Label(camera.portraitActive ? "เบลอ: เปิด" : "หน้าชัดหลังเบลอ", systemImage: "person.crop.rectangle")
+                }
+                .disabled(activeTake || camera.isReconfiguring || !camera.portraitSupported || camera.cameraPosition != .front)
+            }
+            .font(.caption)
+            .foregroundStyle(.white)
+            .padding(.horizontal, 14)
+
+            if camera.isPaused && countdownRemaining == nil {
+                Button {
+                    camera.deleteLastShot()
+                } label: {
+                    Label("ลบช็อตล่าสุด (" + String(format: "%.1f", camera.lastShotSeconds) + " วินาที) · เหลือ " + String(camera.completedShotCount) + " ช็อต", systemImage: "arrow.uturn.backward")
+                }
+                .font(.caption.bold())
+                .foregroundStyle(.yellow)
+                .disabled(camera.completedShotCount == 0 || camera.isReconfiguring || camera.isSaving)
+            }
+
+            Text(camera.isSaving ? "กำลังบันทึก… กรุณารอ" : camera.statusText)
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.8))
+                .lineLimit(2)
                 .padding(.horizontal, 14)
 
             if !camera.recordPreflightMessage.isEmpty {
@@ -2386,6 +2615,7 @@ struct CameraStudioView: View {
                                     .frame(width: 52, height: 52)
                                     .background(.white.opacity(0.17), in: Circle())
                             }
+                            .disabled(camera.isFinishingSegment)
                             .accessibilityLabel("Pause Recording")
                         } else if camera.isPaused {
                             Button {
@@ -2396,6 +2626,7 @@ struct CameraStudioView: View {
                                     .frame(width: 52, height: 52)
                                     .background(.white.opacity(0.17), in: Circle())
                             }
+                            .disabled(countdownRemaining != nil || camera.isReconfiguring || camera.isSaving)
                             .accessibilityLabel("Resume Recording")
                         } else {
                             Color.clear.frame(width: 52, height: 52)
@@ -2455,10 +2686,11 @@ struct CameraStudioView: View {
     }
 
     private var activeTake: Bool {
-        camera.isRecording || camera.isPaused || camera.isStartingRecording
+        camera.isRecording || camera.isPaused || camera.isStartingRecording || camera.isFinishingSegment || camera.isSaving || countdownRemaining != nil
     }
 
     private var shutterEnabled: Bool {
+        if camera.isSaving || camera.isFinishingSegment || camera.isReconfiguring { return false }
         if camera.isRecording || camera.isPaused {
             return true
         }
@@ -2470,41 +2702,40 @@ struct CameraStudioView: View {
     }
 
     private func shutterPressed() {
-        if camera.isRecording || camera.isPaused {
-            countdownToken = UUID()
-            countdownRemaining = nil
-            camera.finishRecording()
-            camera.stopSpeech()
-
-            if teleprompter.isRunning {
-                teleprompter.pause()
-            }
-            return
-        }
-
         if countdownRemaining != nil {
             cancelCountdown()
             return
         }
-
-        if countdownSeconds <= 0 {
-            beginRecording()
+        if camera.isRecording || camera.isPaused {
+            camera.finishRecording()
+            camera.stopSpeech()
+            teleprompter.pause()
             return
         }
+        runCountdown(resuming: false)
+    }
 
+    private func runCountdown(resuming: Bool) {
+        guard countdownRemaining == nil, shutterEnabled else { return }
+        camera.stopSpeech()
+        teleprompter.pause()
+        controlsExpanded = false
+        // Resume always gets at least three seconds, even if initial countdown is Off.
+        let seconds = CameraGeometry.countdown(configured: countdownSeconds, resuming: resuming)
         let token = UUID()
         countdownToken = token
-
+        countdownRemaining = max(1, seconds)
         Task { @MainActor in
-            for value in stride(from: countdownSeconds, through: 1, by: -1) {
-                guard countdownToken == token else { return }
-                countdownRemaining = value
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            if seconds > 0 {
+                for value in stride(from: seconds, through: 1, by: -1) {
+                    guard countdownToken == token else { return }
+                    countdownRemaining = value
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
             }
-
             guard countdownToken == token else { return }
             countdownRemaining = nil
-            beginRecording()
+            if resuming { camera.resumeRecording() } else { beginRecording() }
         }
     }
 
@@ -2518,7 +2749,7 @@ struct CameraStudioView: View {
     }
 
     private func resumeVideo() {
-        camera.resumeRecording()
+        runCountdown(resuming: true)
     }
 
     private func cancelCountdown() {
