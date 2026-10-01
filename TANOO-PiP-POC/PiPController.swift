@@ -497,7 +497,11 @@ final class PiPController: NSObject, ObservableObject {
         if mode == .auto {
             speechTracker.stop()
             speechStatus = "Auto ไม่ใช้ไมโครโฟน"
-            preparePlaybackAudioSession()
+            // When TANOO Camera is active, never switch the shared
+            // AVAudioSession back to playback: the camera needs recording audio.
+            if !usesExternalSpeech {
+                preparePlaybackAudioSession()
+            }
             return
         }
 
