@@ -1361,44 +1361,68 @@ private struct CameraPromptContent: View {
     let size: CGSize
 
     var body: some View {
-        let scale = max(0.72, min(1.18, size.width / 360.0))
-        let fontSize = max(20, snapshot.fontSize * scale)
-        let rowHeight = max(48, fontSize * 1.50 + snapshot.lineSpacing)
+        let scale = max(0.70, min(1.18, size.width / 360.0))
+        let fontSize = max(12, snapshot.fontSize * scale)
+        let rowHeight = max(42, min(size.height / 3.15, fontSize * 1.55 + snapshot.lineSpacing))
+        let eyeY = size.height * 0.43
         let current = max(0, min(snapshot.currentIndex, max(snapshot.segments.count - 1, 0)))
 
-        ZStack(alignment: .top) {
+        ZStack(alignment: .topLeading) {
             Color.black.opacity(snapshot.backgroundOpacity)
 
+            Rectangle()
+                .fill(Color.white.opacity(0.52))
+                .frame(width: size.width, height: 1)
+                .position(x: size.width / 2, y: eyeY)
+
+            HStack(spacing: 0) {
+                Rectangle()
+                    .fill(Color.white.opacity(0.88))
+                    .frame(width: 4, height: 22)
+                Spacer()
+                Rectangle()
+                    .fill(Color.white.opacity(0.88))
+                    .frame(width: 4, height: 22)
+            }
+            .position(x: size.width / 2, y: eyeY)
+
             VStack(spacing: 0) {
-                // Reserve a small handle lane so the first real script line
-                // is never hidden behind the Move control.
-                Color.clear.frame(height: 32)
-
-                ForEach(0..<6, id: \.self) { offset in
+                ForEach(-1...2, id: \.self) { offset in
                     let index = current + offset
+                    let isEyeLine = offset == 0
 
-                    if index < snapshot.segments.count {
+                    if index >= 0 && index < snapshot.segments.count {
                         let value = snapshot.segments[index]
-                        let alpha = offset == 0 ? 1.0 : max(0.42, 0.82 - Double(offset) * 0.10)
 
                         Text(value.isEmpty ? " " : value)
                             .font(.system(
                                 size: fontSize,
-                                weight: offset == 0 ? .semibold : .regular
+                                weight: isEyeLine ? .semibold : .regular
                             ))
-                            .foregroundStyle(Color(snapshot.textColor.uiColor).opacity(alpha))
+                            .foregroundStyle(
+                                Color(snapshot.textColor.uiColor)
+                                    .opacity(isEyeLine ? 1.0 : 0.64)
+                            )
                             .multilineTextAlignment(snapshot.alignment.swiftUITextAlignment)
                             .lineSpacing(snapshot.lineSpacing)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
                             .frame(
                                 maxWidth: .infinity,
                                 minHeight: rowHeight,
                                 alignment: snapshot.alignment.swiftUIFrameAlignment
                             )
-                            .padding(.horizontal, 10)
+                            .padding(.horizontal, 14)
+                    } else {
+                        Color.clear.frame(height: rowHeight)
                     }
                 }
             }
-            .offset(y: -CGFloat(snapshot.progress) * rowHeight)
+            .offset(
+                y: eyeY
+                    - rowHeight * 1.5
+                    - CGFloat(snapshot.progress) * rowHeight
+            )
         }
         .clipped()
     }
@@ -1407,25 +1431,27 @@ private struct CameraPromptContent: View {
 private struct MovableResizableTeleprompter: View {
     @ObservedObject var controller: PiPController
 
-    @State private var centerXRatio: CGFloat = 0.5
-    @State private var centerYRatio: CGFloat = 0.18
-    @State private var widthRatio: CGFloat = 0.94
-    @State private var boxHeight: CGFloat = 190
+    @AppStorage("TANOO.camera.prompt.centerX") private var storedCenterX = 0.5
+    @AppStorage("TANOO.camera.prompt.centerY") private var storedCenterY = 0.18
+    @AppStorage("TANOO.camera.prompt.width") private var storedWidth = 0.94
+    @AppStorage("TANOO.camera.prompt.height") private var storedHeight = 190.0
 
     @State private var moveStart: CGPoint?
     @State private var resizeStart: CGSize?
 
     var body: some View {
         GeometryReader { geo in
-            let width = max(220, min(geo.size.width * widthRatio, geo.size.width))
-            let height = max(105, min(boxHeight, geo.size.height * 0.62))
+            let widthRatio = CGFloat(storedWidth)
+            let boxHeight = CGFloat(storedHeight)
+            let width = max(200, min(geo.size.width * widthRatio, geo.size.width))
+            let height = max(120, min(boxHeight, geo.size.height * 0.68))
             let centerX = clamp(
-                centerXRatio * geo.size.width,
+                CGFloat(storedCenterX) * geo.size.width,
                 lower: width / 2,
                 upper: geo.size.width - width / 2
             )
             let centerY = clamp(
-                centerYRatio * geo.size.height,
+                CGFloat(storedCenterY) * geo.size.height,
                 lower: height / 2,
                 upper: geo.size.height - height / 2
             )
@@ -1437,38 +1463,40 @@ private struct MovableResizableTeleprompter: View {
                 )
             }
             .frame(width: width, height: height)
-            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
             .overlay {
-                RoundedRectangle(cornerRadius: 12)
+                RoundedRectangle(cornerRadius: 10)
                     .stroke(.white.opacity(0.28), lineWidth: 1)
                     .allowsHitTesting(false)
             }
             .overlay(alignment: .topLeading) {
-                Label("ย้าย", systemImage: "arrow.up.and.down.and.arrow.left.and.right")
-                    .font(.caption2.bold())
+                Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
+                    .font(.caption.bold())
                     .foregroundStyle(.white)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 5)
-                    .background(.black.opacity(0.62), in: Capsule())
-                    .padding(4)
+                    .padding(7)
+                    .background(.black.opacity(0.58), in: Circle())
+                    .padding(3)
                     .gesture(
                         DragGesture()
                             .onChanged { value in
                                 if moveStart == nil {
-                                    moveStart = CGPoint(x: centerXRatio, y: centerYRatio)
+                                    moveStart = CGPoint(
+                                        x: CGFloat(storedCenterX),
+                                        y: CGFloat(storedCenterY)
+                                    )
                                 }
 
                                 guard let moveStart else { return }
-                                centerXRatio = clamp(
+                                storedCenterX = Double(clamp(
                                     moveStart.x + value.translation.width / max(geo.size.width, 1),
                                     lower: 0,
                                     upper: 1
-                                )
-                                centerYRatio = clamp(
+                                ))
+                                storedCenterY = Double(clamp(
                                     moveStart.y + value.translation.height / max(geo.size.height, 1),
                                     lower: 0,
                                     upper: 1
-                                )
+                                ))
                             }
                             .onEnded { _ in
                                 moveStart = nil
@@ -1479,27 +1507,30 @@ private struct MovableResizableTeleprompter: View {
                 Image(systemName: "arrow.up.left.and.down.right")
                     .font(.caption.bold())
                     .foregroundStyle(.white)
-                    .padding(9)
-                    .background(.black.opacity(0.62), in: Circle())
-                    .padding(4)
+                    .padding(8)
+                    .background(.black.opacity(0.58), in: Circle())
+                    .padding(3)
                     .gesture(
                         DragGesture()
                             .onChanged { value in
                                 if resizeStart == nil {
-                                    resizeStart = CGSize(width: widthRatio, height: boxHeight)
+                                    resizeStart = CGSize(
+                                        width: CGFloat(storedWidth),
+                                        height: CGFloat(storedHeight)
+                                    )
                                 }
 
                                 guard let resizeStart else { return }
-                                widthRatio = clamp(
+                                storedWidth = Double(clamp(
                                     resizeStart.width + value.translation.width / max(geo.size.width, 1),
-                                    lower: 0.52,
+                                    lower: 0.50,
                                     upper: 1.0
-                                )
-                                boxHeight = clamp(
+                                ))
+                                storedHeight = Double(clamp(
                                     resizeStart.height + value.translation.height,
-                                    lower: 105,
-                                    upper: geo.size.height * 0.62
-                                )
+                                    lower: 120,
+                                    upper: geo.size.height * 0.68
+                                ))
                             }
                             .onEnded { _ in
                                 resizeStart = nil
@@ -1522,8 +1553,8 @@ struct CameraStudioView: View {
     var onOpenScript: (() -> Void)? = nil
 
     @State private var cameraStarted = false
-    @State private var controlsExpanded = true
-    @State private var countdownSeconds = 3
+    @AppStorage("TANOO.camera.controlsExpanded") private var controlsExpanded = true
+    @AppStorage("TANOO.camera.countdownSeconds") private var countdownSeconds = 3
     @State private var countdownRemaining: Int?
     @State private var countdownToken = UUID()
 
@@ -1540,28 +1571,6 @@ struct CameraStudioView: View {
 
             if cameraStarted {
                 MovableResizableTeleprompter(controller: teleprompter)
-
-                VStack {
-                    HStack(spacing: 7) {
-                        statusBadge(camera.resolution.rawValue)
-                        statusBadge(String(Int(camera.frameRate)) + " FPS")
-
-                        if camera.isReconfiguring {
-                            statusBadge("กำลังเปลี่ยน…")
-                        }
-
-                        Spacer()
-
-                        if camera.isRecording {
-                            statusBadge("REC " + formatDuration(camera.recordingSeconds))
-                        }
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.top, 4)
-
-                    Spacer()
-                }
-                .ignoresSafeArea(edges: .top)
             }
 
             if let countdownRemaining {
@@ -1588,9 +1597,11 @@ struct CameraStudioView: View {
             }
             .ignoresSafeArea(edges: .bottom)
         }
+        .statusBarHidden(true)
         .toolbar(.hidden, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
         .onAppear {
+            UIApplication.shared.isIdleTimerDisabled = true
             teleprompter.setUsesExternalSpeech(true)
             camera.onTranscript = { transcript in
                 Task { @MainActor in
@@ -1599,6 +1610,7 @@ struct CameraStudioView: View {
             }
         }
         .onDisappear {
+            UIApplication.shared.isIdleTimerDisabled = false
             countdownToken = UUID()
             countdownRemaining = nil
             camera.stopSpeech()
@@ -1611,6 +1623,9 @@ struct CameraStudioView: View {
         }
         .onChange(of: camera.isRecording) { recording in
             if recording {
+                if !teleprompter.isRunning {
+                    teleprompter.start()
+                }
                 syncSpeech()
             } else {
                 camera.stopSpeech()
@@ -1651,66 +1666,116 @@ struct CameraStudioView: View {
         }
     }
 
-    private var collapsedControls: some View {
-        HStack(spacing: 10) {
-            Button {
-                onOpenScript?()
-            } label: {
-                Image(systemName: "doc.text")
-            }
-
-            Button {
-                controlsExpanded = true
-            } label: {
-                Label("เครื่องมือ", systemImage: "chevron.up")
-            }
-
-            Spacer()
-
-            if countdownRemaining != nil {
-                Button("ยกเลิก") {
-                    cancelCountdown()
-                }
-                .foregroundStyle(.orange)
-            } else {
-                Button {
-                    recordButtonPressed()
-                } label: {
-                    HStack(spacing: 6) {
+    private var recordInfoBar: some View {
+        VStack(spacing: 4) {
+            HStack(spacing: 8) {
+                if camera.isRecording {
+                    HStack(spacing: 5) {
                         Circle()
-                            .fill(camera.isRecording ? Color.white : Color.red)
-                            .frame(width: 18, height: 18)
-                        Text(camera.isRecording ? "STOP" : "REC")
+                            .fill(Color.red)
+                            .frame(width: 8, height: 8)
+                        Text("REC " + formatDuration(camera.recordingSeconds))
+                            .foregroundStyle(.red)
                             .fontWeight(.semibold)
                     }
+                } else if camera.isStartingRecording {
+                    Text("กำลังเริ่ม REC…")
+                        .foregroundStyle(.orange)
                 }
-                .disabled(!recordButtonAvailable)
+
+                Spacer()
+
+                Text(camera.resolution.rawValue)
+                Text("·")
+                Text(String(Int(camera.frameRate)) + " FPS")
+                Text("·")
+                Text(String(format: "%.1f GB", camera.availableDiskGB))
+            }
+            .font(.caption2)
+
+            if camera.focusExposureLocked {
+                Text("AE/AF LOCK • แตะ 1 ครั้งเพื่อโฟกัสใหม่")
+                    .font(.caption2.bold())
+                    .foregroundStyle(.yellow)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    private var collapsedControls: some View {
+        VStack(spacing: 7) {
+            recordInfoBar
+                .foregroundStyle(.white)
+
+            HStack(spacing: 9) {
+                Button {
+                    onOpenScript?()
+                } label: {
+                    Image(systemName: "doc.text")
+                }
+
+                Button {
+                    teleprompter.fontSize = max(12, teleprompter.fontSize - 2)
+                } label: {
+                    Text("A−")
+                }
+
+                Text(String(Int(teleprompter.fontSize)))
+                    .font(.caption.monospacedDigit())
+                    .frame(minWidth: 24)
+
+                Button {
+                    teleprompter.fontSize = min(68, teleprompter.fontSize + 2)
+                } label: {
+                    Text("A+")
+                }
+
+                Button {
+                    controlsExpanded = true
+                } label: {
+                    Image(systemName: "chevron.up")
+                }
+
+                Spacer()
+
+                if countdownRemaining != nil {
+                    Button("ยกเลิก") {
+                        cancelCountdown()
+                    }
+                    .foregroundStyle(.orange)
+                } else {
+                    Button {
+                        recordButtonPressed()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(camera.isRecording ? Color.white : Color.red)
+                                .frame(width: 18, height: 18)
+                            Text(camera.isRecording ? "STOP" : "REC")
+                                .fontWeight(.semibold)
+                        }
+                    }
+                    .disabled(!recordButtonAvailable)
+                }
             }
         }
         .foregroundStyle(.white)
         .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(.black.opacity(0.76), in: Capsule())
-        .padding(.horizontal, 12)
-        .padding(.bottom, 8)
+        .padding(.vertical, 9)
+        .background(.black.opacity(0.80), in: RoundedRectangle(cornerRadius: 16))
+        .padding(.horizontal, 8)
+        .padding(.bottom, 4)
     }
 
     private var expandedControls: some View {
         ScrollView {
-            VStack(spacing: 10) {
+            VStack(spacing: 9) {
                 HStack {
                     Button {
                         onOpenScript?()
                     } label: {
                         Label("Script", systemImage: "doc.text")
                     }
-
-                    Spacer()
-
-                    Text(camera.statusText)
-                        .font(.caption2)
-                        .lineLimit(1)
-                        .foregroundStyle(.secondary)
 
                     Spacer()
 
@@ -1745,7 +1810,8 @@ struct CameraStudioView: View {
 
                 HStack(spacing: 8) {
                     Text("Countdown")
-                        .font(.caption)
+                        .font(.caption2)
+
                     Picker("Countdown", selection: $countdownSeconds) {
                         Text("Off").tag(0)
                         Text("3").tag(3)
@@ -1759,7 +1825,7 @@ struct CameraStudioView: View {
                     Button {
                         teleprompter.previous()
                     } label: {
-                        Label("ย้อน", systemImage: "backward.end.fill")
+                        Image(systemName: "backward.end.fill")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
@@ -1778,7 +1844,7 @@ struct CameraStudioView: View {
                     Button {
                         teleprompter.next()
                     } label: {
-                        Label("ถัดไป", systemImage: "forward.end.fill")
+                        Image(systemName: "forward.end.fill")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
@@ -1794,16 +1860,24 @@ struct CameraStudioView: View {
                     .buttonStyle(.bordered)
 
                     Button {
-                        camera.toggleFocusExposureLock()
+                        teleprompter.fontSize = max(12, teleprompter.fontSize - 2)
                     } label: {
-                        Label(
-                            camera.focusExposureLocked ? "AE/AF LOCK" : "Lock",
-                            systemImage: camera.focusExposureLocked ? "lock.fill" : "lock.open"
-                        )
-                        .frame(maxWidth: .infinity)
+                        Text("A−")
+                            .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
-                    .disabled(!cameraStarted)
+
+                    Text(String(Int(teleprompter.fontSize)))
+                        .font(.caption.monospacedDigit())
+                        .frame(minWidth: 24)
+
+                    Button {
+                        teleprompter.fontSize = min(68, teleprompter.fontSize + 2)
+                    } label: {
+                        Text("A+")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
 
                     Button {
                         teleprompter.autoSpeed = min(2.5, teleprompter.autoSpeed + 0.1)
@@ -1837,6 +1911,13 @@ struct CameraStudioView: View {
                 }
                 .disabled(!cameraStarted)
 
+                Text("แตะภาพ = Focus • กดค้าง = AE/AF Lock")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                recordInfoBar
+
                 if countdownRemaining != nil {
                     Button("ยกเลิกนับถอยหลัง") {
                         cancelCountdown()
@@ -1864,6 +1945,11 @@ struct CameraStudioView: View {
                     .disabled(!recordButtonAvailable)
                 }
 
+                Text(camera.statusText)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
                 if teleprompter.mode != .auto {
                     Text(teleprompter.speechStatus)
                         .font(.caption2)
@@ -1871,13 +1957,13 @@ struct CameraStudioView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-            .padding(12)
+            .padding(11)
         }
-        .frame(maxHeight: 370)
+        .frame(maxHeight: 410)
         .background(.ultraThinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 18))
-        .padding(.horizontal, 8)
-        .padding(.bottom, 4)
+        .padding(.horizontal, 6)
+        .padding(.bottom, 3)
     }
 
     private var recordButtonAvailable: Bool {
@@ -1928,20 +2014,17 @@ struct CameraStudioView: View {
     private func beginRecording() {
         guard recordButtonAvailable else { return }
 
-        // Every new take starts from the first script line so the first line
-        // can never disappear because of progress left over from a previous take.
-        teleprompter.resetPosition()
-
-        if !teleprompter.isRunning {
-            teleprompter.start()
+        if teleprompter.isRunning {
+            teleprompter.pause()
         }
+        teleprompter.resetPosition()
 
         camera.toggleRecording()
 
-        // If the recorder failed before didStartRecording, don't leave Auto
-        // scrolling by itself.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            if !camera.isRecording && !camera.isStartingRecording && teleprompter.isRunning {
+            if !camera.isRecording &&
+               !camera.isStartingRecording &&
+               teleprompter.isRunning {
                 teleprompter.pause()
             }
         }
@@ -1958,15 +2041,6 @@ struct CameraStudioView: View {
         }
 
         camera.startSpeech()
-    }
-
-    private func statusBadge(_ text: String) -> some View {
-        Text(text)
-            .font(.caption2.bold())
-            .foregroundStyle(.white)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 4)
-            .background(.black.opacity(0.70), in: Capsule())
     }
 
     private func slider(
