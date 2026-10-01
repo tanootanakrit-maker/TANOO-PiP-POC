@@ -1120,16 +1120,20 @@ final class CameraController: NSObject, ObservableObject {
         let directory = FileManager.default.temporaryDirectory
         guard let files = try? FileManager.default.contentsOfDirectory(
             at: directory,
-            includingPropertiesForKeys: nil
+            includingPropertiesForKeys: [.contentModificationDateKey]
         ) else { return }
 
         let preserved = Set(recordingSegments + [currentRecordingURL].compactMap { $0 })
+        let staleBefore = Date().addingTimeInterval(-300)
 
         for file in files
         where file.lastPathComponent.hasPrefix("TANOO-") &&
               file.pathExtension.lowercased() == "mov" &&
               !preserved.contains(file) {
-            try? FileManager.default.removeItem(at: file)
+            let values = try? file.resourceValues(forKeys: [.contentModificationDateKey])
+            if let modified = values?.contentModificationDate, modified < staleBefore {
+                try? FileManager.default.removeItem(at: file)
+            }
         }
     }
 
@@ -1354,6 +1358,8 @@ extension CameraController: AVCaptureFileOutputRecordingDelegate {
             self.isRecording = false
             self.recordingTimer?.invalidate()
             self.recordingTimer = nil
+
+            self.currentRecordingURL = nil
 
             if let error {
                 try? FileManager.default.removeItem(at: outputFileURL)
