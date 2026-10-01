@@ -1253,10 +1253,19 @@ struct CameraPreview: UIViewRepresentable {
         let view = PreviewView()
         view.setSession(controller.session)
 
+        let longPress = UILongPressGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.didLongPress(_:))
+        )
+        longPress.minimumPressDuration = 0.55
+
         let tap = UITapGestureRecognizer(
             target: context.coordinator,
             action: #selector(Coordinator.didTap(_:))
         )
+        tap.require(toFail: longPress)
+
+        view.addGestureRecognizer(longPress)
         view.addGestureRecognizer(tap)
         context.coordinator.previewView = view
 
@@ -1288,6 +1297,13 @@ struct CameraPreview: UIViewRepresentable {
             let point = gesture.location(in: view)
             let devicePoint = view.previewLayer.captureDevicePointConverted(fromLayerPoint: point)
             controller.focus(at: devicePoint)
+        }
+
+        @objc func didLongPress(_ gesture: UILongPressGestureRecognizer) {
+            guard gesture.state == .began, let view = previewView else { return }
+            let point = gesture.location(in: view)
+            let devicePoint = view.previewLayer.captureDevicePointConverted(fromLayerPoint: point)
+            controller.lockFocus(at: devicePoint)
         }
     }
 }
