@@ -1323,8 +1323,16 @@ extension CameraController: AVCaptureFileOutputRecordingDelegate {
         Task { @MainActor in
             self.isStartingRecording = false
             self.isRecording = true
-            self.recordingSeconds = 0
-            self.statusText = "REC • " + self.captureMode.title + " " + self.resolution.rawValue + " " + String(Int(self.frameRate)) + "fps"
+            self.isPaused = false
+
+            if self.resetDurationOnNextSegment {
+                self.recordingSeconds = 0
+                self.resetDurationOnNextSegment = false
+            }
+
+            self.statusText = self.recordingSegments.isEmpty
+                ? "REC • " + self.resolution.rawValue + " " + String(Int(self.frameRate)) + "fps"
+                : "REC ต่อ • " + self.resolution.rawValue + " " + String(Int(self.frameRate)) + "fps"
 
             self.recordingTimer?.invalidate()
             self.recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
@@ -1348,13 +1356,25 @@ extension CameraController: AVCaptureFileOutputRecordingDelegate {
             self.recordingTimer = nil
 
             if let error {
-                self.statusText = "REC ERROR: " + error.localizedDescription
-            } else if self.recordingSeconds < 0.5 {
-                self.statusText = "REC หยุดก่อน 1 วินาที — ตรวจระบบเสียง/Voice"
                 try? FileManager.default.removeItem(at: outputFileURL)
+                self.refreshDiskSpace()
+                self.isPaused = !self.recordingSegments.isEmpty
+                self.statusText = "REC ERROR: " + error.localizedDescription
             } else {
-                self.saveVideoToPhotos(outputFileURL)
+                self.recordingSegments.append(outputFileURL)
+
+                switch self.stopAction {
+                case .pause:
+                    self.isPaused = true
+                    self.statusText = "PAUSE • กด ▶ เพื่อบันทึกต่อ"
+
+                case .finish:
+                    self.isPaused = false
+                    self.finalizeRecordingSegments()
+                }
             }
+
+            self.stopAction = .finish
 
             self.sessionQueue.async { [weak self] in
                 guard let self else { return }
