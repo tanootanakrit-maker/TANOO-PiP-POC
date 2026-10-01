@@ -47,6 +47,8 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var diagnosticStage = 0
     @Published private(set) var isRunning = false
     @Published private(set) var isRecording = false
+    @Published private(set) var isStartingRecording = false
+    @Published private(set) var isReconfiguring = false
     @Published private(set) var statusText = "กำลังเตรียมกล้อง…"
     @Published private(set) var recordingSeconds: TimeInterval = 0
 
@@ -265,9 +267,14 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func reconfigure() {
-        guard isConfigured, !isRecording else { return }
+        guard isConfigured, !isRecording, !isStartingRecording, !isReconfiguring else { return }
+
+        isReconfiguring = true
+        statusText = "กำลังเปลี่ยนคุณภาพกล้อง…"
+
         sessionQueue.async { [weak self] in
-            self?.applyCaptureSettings()
+            guard let self else { return }
+            self.applyCaptureSettings()
         }
     }
 
@@ -636,15 +643,21 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     private func applyCaptureSettings(manageSessionConfiguration: Bool = true) {
-        guard let device = currentDevice, let input = videoInput else { return }
+        guard let device = currentDevice, let input = videoInput else {
+            Task { @MainActor in
+                self.isReconfiguring = false
+            }
+            return
+        }
+
+        let wasRunning = session.isRunning
+
+        if manageSessionConfiguration && wasRunning {
+            session.stopRunning()
+        }
 
         if manageSessionConfiguration {
             session.beginConfiguration()
-        }
-        defer {
-            if manageSessionConfiguration {
-                session.commitConfiguration()
-            }
         }
 
         if #available(iOS 26.0, *) {
@@ -653,67 +666,100 @@ final class CameraController: NSObject, ObservableObject {
             }
         }
 
-        let requestedMode = captureMode
-        let dimensions = resolution.dimensions
+        var selectedResolution = resolution
+        var selectedFPS = frameRate
+        var configurationMessage: String?
 
-        let candidates = device.formats.filter { format in
-            let d = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-            guard d.width == dimensions.width, d.height == dimensions.height else { return false }
+        if captureMode == .video {
+            let requestedPreset: AVCaptureSession.Preset =
+                resolution == .uhd4K ? .hd4K3840x2160 : .hd1920x1080
 
-            if requestedMode == .cinematic {
-                if #available(iOS 26.0, *) {
-                    guard format.isCinematicVideoCaptureSupported,
-                          let range = format.videoFrameRateRangeForCinematicVideo else { return false }
-                    return frameRate >= range.minFrameRate && frameRate <= range.maxFrameRate
-                } else {
-                    return false
+            if session.canSetSessionPreset(requestedPreset) {
+                session.sessionPreset = requestedPreset
+            } else {
+                selectedResolution = .hd1080
+                if session.canSetSessionPreset(.hd1920x1080) {
+                    session.sessionPreset = .hd1920x1080
                 }
+                configurationMessage = "4K ไม่รองรับกับ configuration นี้ — กลับเป็น 1080p"
             }
 
-            return format.videoSupportedFrameRateRanges.contains {
-                frameRate >= $0.minFrameRate && frameRate <= $0.maxFrameRate
-            }
-        }
-
-        if let selected = candidates.first {
             do {
                 try device.lockForConfiguration()
-                device.activeFormat = selected
 
-                let duration = CMTime(value: 1, timescale: CMTimeScale(frameRate))
+                let ranges = device.activeFormat.videoSupportedFrameRateRanges
+                let requestedSupported = ranges.contains {
+                    selectedFPS >= $0.minFrameRate && selectedFPS <= $0.maxFrameRate
+                }
+
+                if !requestedSupported {
+                    let thirtySupported = ranges.contains {
+                        30 >= $0.minFrameRate && 30 <= $0.maxFrameRate
+                    }
+                    selectedFPS = thirtySupported ? 30 : (ranges.first?.maxFrameRate ?? 30)
+                    configurationMessage = (configurationMessage ?? "") +
+                        (configurationMessage == nil ? "" : " • ") +
+                        "FPS ปรับเป็น " + String(Int(selectedFPS))
+                }
+
+                let duration = CMTime(value: 1, timescale: CMTimeScale(max(1, Int32(selectedFPS))))
                 device.activeVideoMinFrameDuration = duration
                 device.activeVideoMaxFrameDuration = duration
 
                 if device.isExposureModeSupported(.continuousAutoExposure) && !focusExposureLocked {
                     device.exposureMode = .continuousAutoExposure
                 }
-                if captureMode != .cinematic,
-                   device.isFocusModeSupported(.continuousAutoFocus),
-                   !focusExposureLocked {
+                if device.isFocusModeSupported(.continuousAutoFocus) && !focusExposureLocked {
                     device.focusMode = .continuousAutoFocus
                 }
 
                 device.unlockForConfiguration()
             } catch {
-                Task { @MainActor in
-                    self.statusText = "เลือก " + self.resolution.rawValue + " " + String(Int(self.frameRate)) + "fps ไม่สำเร็จ"
-                }
+                configurationMessage = "ตั้งค่า FPS ไม่สำเร็จ: " + error.localizedDescription
             }
         } else {
-            Task { @MainActor in
-                self.statusText = "ไม่พบ Format " + self.resolution.rawValue + " " + String(Int(self.frameRate)) + "fps สำหรับ " + self.captureMode.title
-            }
-        }
+            // Advanced modes keep format-specific capability checks.
+            let dimensions = resolution.dimensions
+            let candidates = device.formats.filter { format in
+                let d = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+                guard d.width == dimensions.width, d.height == dimensions.height else { return false }
 
-        if captureMode == .cinematic {
-            if #available(iOS 26.0, *) {
-                if input.isCinematicVideoCaptureSupported {
+                if captureMode == .cinematic {
+                    if #available(iOS 26.0, *) {
+                        guard format.isCinematicVideoCaptureSupported,
+                              let range = format.videoFrameRateRangeForCinematicVideo else { return false }
+                        return frameRate >= range.minFrameRate && frameRate <= range.maxFrameRate
+                    }
+                    return false
+                }
+
+                return format.videoSupportedFrameRateRanges.contains {
+                    frameRate >= $0.minFrameRate && frameRate <= $0.maxFrameRate
+                }
+            }
+
+            if let selected = candidates.first {
+                do {
+                    try device.lockForConfiguration()
+                    device.activeFormat = selected
+                    let duration = CMTime(value: 1, timescale: CMTimeScale(max(1, Int32(frameRate))))
+                    device.activeVideoMinFrameDuration = duration
+                    device.activeVideoMaxFrameDuration = duration
+                    device.unlockForConfiguration()
+                } catch {
+                    configurationMessage = "เลือก Format ไม่สำเร็จ: " + error.localizedDescription
+                }
+            } else {
+                configurationMessage = "ไม่พบ Format ที่รองรับ"
+            }
+
+            if captureMode == .cinematic {
+                if #available(iOS 26.0, *), input.isCinematicVideoCaptureSupported {
                     input.isCinematicVideoCaptureEnabled = true
                     let minA = device.activeFormat.minSimulatedAperture
                     let maxA = device.activeFormat.maxSimulatedAperture
                     if minA > 0, maxA >= minA {
-                        let aperture = min(max(simulatedAperture, minA), maxA)
-                        input.simulatedAperture = aperture
+                        input.simulatedAperture = min(max(simulatedAperture, minA), maxA)
                     }
                 }
             }
@@ -721,6 +767,27 @@ final class CameraController: NSObject, ObservableObject {
 
         configureVideoConnection()
         updateCapabilities()
+
+        if manageSessionConfiguration {
+            session.commitConfiguration()
+        }
+
+        if manageSessionConfiguration && wasRunning && !session.isRunning {
+            session.startRunning()
+        }
+
+        Task { @MainActor in
+            self.resolution = selectedResolution
+            self.frameRate = selectedFPS
+            self.isRunning = self.session.isRunning
+            self.isReconfiguring = false
+
+            if let configurationMessage, !configurationMessage.isEmpty {
+                self.statusText = configurationMessage
+            } else {
+                self.statusText = "พร้อม • " + selectedResolution.rawValue + " " + String(Int(selectedFPS)) + "fps"
+            }
+        }
     }
 
     private func configureVideoConnection() {
@@ -836,7 +903,14 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     private func startRecording() {
-        guard isConfigured, !movieOutput.isRecording else { return }
+        guard isConfigured,
+              !movieOutput.isRecording,
+              !isStartingRecording,
+              !isReconfiguring,
+              session.isRunning else {
+            statusText = isReconfiguring ? "รอเปลี่ยนคุณภาพกล้องให้เสร็จก่อน" : "กล้องยังไม่พร้อมบันทึก"
+            return
+        }
 
         prepareCameraAudioSession()
         configureVideoConnection()
@@ -846,25 +920,22 @@ final class CameraController: NSObject, ObservableObject {
             .appendingPathExtension("mov")
 
         currentRecordingURL = url
-        movieOutput.startRecording(to: url, recordingDelegate: self)
-        isRecording = true
         recordingSeconds = 0
-        statusText = "REC • " + captureMode.title + " " + resolution.rawValue + " " + String(Int(frameRate)) + "fps"
+        isStartingRecording = true
+        statusText = "กำลังเริ่ม REC…"
 
-        recordingTimer?.invalidate()
-        recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.recordingSeconds += 0.25
-            }
-        }
+        movieOutput.startRecording(to: url, recordingDelegate: self)
     }
 
     private func stopRecording() {
-        guard movieOutput.isRecording else { return }
+        guard movieOutput.isRecording else {
+            isStartingRecording = false
+            return
+        }
         movieOutput.stopRecording()
         recordingTimer?.invalidate()
         recordingTimer = nil
-        statusText = "กำลังบันทึกลง Photos…"
+        statusText = "กำลังปิดไฟล์วิดีโอ…"
     }
 
     private func saveVideoToPhotos(_ url: URL) {
@@ -895,11 +966,32 @@ final class CameraController: NSObject, ObservableObject {
 extension CameraController: AVCaptureFileOutputRecordingDelegate {
     func fileOutput(
         _ output: AVCaptureFileOutput,
+        didStartRecordingTo fileURL: URL,
+        from connections: [AVCaptureConnection]
+    ) {
+        Task { @MainActor in
+            self.isStartingRecording = false
+            self.isRecording = true
+            self.recordingSeconds = 0
+            self.statusText = "REC • " + self.captureMode.title + " " + self.resolution.rawValue + " " + String(Int(self.frameRate)) + "fps"
+
+            self.recordingTimer?.invalidate()
+            self.recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+                Task { @MainActor in
+                    self?.recordingSeconds += 0.25
+                }
+            }
+        }
+    }
+
+    func fileOutput(
+        _ output: AVCaptureFileOutput,
         didFinishRecordingTo outputFileURL: URL,
         from connections: [AVCaptureConnection],
         error: Error?
     ) {
         Task { @MainActor in
+            self.isStartingRecording = false
             self.isRecording = false
             self.recordingTimer?.invalidate()
             self.recordingTimer = nil
@@ -911,6 +1003,16 @@ extension CameraController: AVCaptureFileOutputRecordingDelegate {
                 try? FileManager.default.removeItem(at: outputFileURL)
             } else {
                 self.saveVideoToPhotos(outputFileURL)
+            }
+
+            self.sessionQueue.async { [weak self] in
+                guard let self else { return }
+                if !self.session.isRunning {
+                    self.session.startRunning()
+                    Task { @MainActor in
+                        self.isRunning = self.session.isRunning
+                    }
+                }
             }
         }
     }
