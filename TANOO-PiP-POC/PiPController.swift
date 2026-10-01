@@ -24,6 +24,39 @@ enum TeleprompterMode: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+enum VoiceFocusLevel: String, Codable, CaseIterable, Identifiable {
+    case low
+    case normal
+    case high
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .low: return "ต่ำ"
+        case .normal: return "ปกติ"
+        case .high: return "สูง"
+        }
+    }
+
+    // Fixed recognition profiles. They never depend on the number of words spoken.
+    var matchThreshold: Double {
+        switch self {
+        case .low: return 0.38
+        case .normal: return 0.58
+        case .high: return 0.78
+        }
+    }
+
+    var anchorLength: Int {
+        switch self {
+        case .low: return 4
+        case .normal: return 5
+        case .high: return 6
+        }
+    }
+}
+
 enum PromptAlignment: String, Codable, CaseIterable, Identifiable {
     case left
     case center
@@ -92,6 +125,7 @@ struct SavedProject: Codable, Identifiable {
     var textAlignment: PromptAlignment
     var textColorStyle: PromptTextColor
     var voiceSensitivity: Double?
+    var voiceFocusLevel: VoiceFocusLevel?
     var updatedAt: Date
 }
 
@@ -124,6 +158,7 @@ final class PiPController: NSObject, ObservableObject {
     @Published var lineSpacing: CGFloat = 10
     @Published var autoSpeed: Double = 1.0
     @Published var voiceSensitivity: Double = 0.40
+    @Published var voiceFocusLevel: VoiceFocusLevel = .normal
     @Published var verticalPosition: Double = 0.18
     @Published var backgroundOpacity: Double = 0.78
     @Published var textAlignment: PromptAlignment = .center
@@ -158,6 +193,8 @@ final class PiPController: NSObject, ObservableObject {
     private let speechTracker = SpeechTracker()
     private var lastMatchedTranscript = ""
     private var usesExternalSpeech = false
+    private var voiceConsumedCharacters = 0
+    private var lastVoiceAdvanceAt: CFTimeInterval = 0
 
     private let projectsKey = "TANOO.savedProjects.v1"
 
@@ -320,9 +357,11 @@ final class PiPController: NSObject, ObservableObject {
             return
         }
         isRunning = true
+        voiceConsumedCharacters = 0
+        lastVoiceAdvanceAt = 0
         let now = CACurrentMediaTime()
         lastTick = now
-        segmentStartTime = now - progress * currentLineDuration()
+        segmentStartTime = now - progress * currentLineDuration(for: segments.indices.contains(currentIndex) ? segments[currentIndex] : "")
         configureSpeechForCurrentMode()
         statusText = "กำลังทำงาน: \(mode.title)"
         renderViews()
@@ -356,6 +395,8 @@ final class PiPController: NSObject, ObservableObject {
         progress = 0
         segmentStartTime = CACurrentMediaTime()
         lastMatchedTranscript = ""
+        voiceConsumedCharacters = 0
+        lastVoiceAdvanceAt = 0
         renderViews()
     }
 
@@ -377,6 +418,7 @@ final class PiPController: NSObject, ObservableObject {
             textAlignment: textAlignment,
             textColorStyle: textColorStyle,
             voiceSensitivity: voiceSensitivity,
+            voiceFocusLevel: voiceFocusLevel,
             updatedAt: Date()
         )
 
@@ -395,6 +437,7 @@ final class PiPController: NSObject, ObservableObject {
                 textAlignment: project.textAlignment,
                 textColorStyle: project.textColorStyle,
                 voiceSensitivity: project.voiceSensitivity,
+                voiceFocusLevel: project.voiceFocusLevel,
                 updatedAt: project.updatedAt
             )
             savedProjects[index] = updated
@@ -419,6 +462,7 @@ final class PiPController: NSObject, ObservableObject {
         textAlignment = project.textAlignment
         textColorStyle = project.textColorStyle
         voiceSensitivity = project.voiceSensitivity ?? 0.40
+        voiceFocusLevel = project.voiceFocusLevel ?? .normal
         rebuildSegments(reset: true)
         modeDidChange()
         statusText = "โหลดโปรเจกต์ “\(project.name)” แล้ว"
@@ -441,6 +485,7 @@ final class PiPController: NSObject, ObservableObject {
         static let lineSpacing = "TANOO.current.lineSpacing"
         static let autoSpeed = "TANOO.current.autoSpeed"
         static let voiceSensitivity = "TANOO.current.voiceSensitivity"
+        static let voiceFocusLevel = "TANOO.current.voiceFocusLevel"
         static let verticalPosition = "TANOO.current.verticalPosition"
         static let backgroundOpacity = "TANOO.current.backgroundOpacity"
         static let alignment = "TANOO.current.alignment"
@@ -471,6 +516,10 @@ final class PiPController: NSObject, ObservableObject {
         }
         if defaults.object(forKey: CurrentSettingKey.voiceSensitivity) != nil {
             voiceSensitivity = defaults.double(forKey: CurrentSettingKey.voiceSensitivity)
+        }
+        if let raw = defaults.string(forKey: CurrentSettingKey.voiceFocusLevel),
+           let value = VoiceFocusLevel(rawValue: raw) {
+            voiceFocusLevel = value
         }
         if defaults.object(forKey: CurrentSettingKey.verticalPosition) != nil {
             verticalPosition = defaults.double(forKey: CurrentSettingKey.verticalPosition)
@@ -535,13 +584,19 @@ final class PiPController: NSObject, ObservableObject {
             .sink { [weak self] value in
                 defaults.set(value, forKey: CurrentSettingKey.autoSpeed)
                 guard let self else { return }
-                self.segmentStartTime = CACurrentMediaTime() - self.progress * self.currentLineDuration()
+                let current = self.segments.indices.contains(self.currentIndex) ? self.segments[self.currentIndex] : ""
+                self.segmentStartTime = CACurrentMediaTime() - self.progress * self.currentLineDuration(for: current)
             }
             .store(in: &settingsCancellables)
 
         $voiceSensitivity
             .dropFirst()
             .sink { defaults.set($0, forKey: CurrentSettingKey.voiceSensitivity) }
+            .store(in: &settingsCancellables)
+
+        $voiceFocusLevel
+            .dropFirst()
+            .sink { defaults.set($0.rawValue, forKey: CurrentSettingKey.voiceFocusLevel) }
             .store(in: &settingsCancellables)
 
         $verticalPosition
@@ -602,10 +657,18 @@ final class PiPController: NSObject, ObservableObject {
         }
     }
 
-    private func currentLineDuration() -> Double {
-        // Every script line — including an intentionally blank line — uses
-        // exactly the same duration. This removes speed changes caused by text length.
-        max(0.65, 3.4 / max(autoSpeed, 0.1))
+    private func currentLineDuration(for segment: String? = nil) -> Double {
+        let normal = max(0.65, 3.4 / max(autoSpeed, 0.1))
+        let isBlank = (segment ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
+        // In Auto, blank lines keep exactly the same pacing as text lines.
+        // In Voice/Hybrid, once Voice reaches an intentional blank line,
+        // glide through it quickly but smoothly to bring the next spoken line to EyeLine.
+        if isBlank && mode != .auto {
+            return max(0.45, min(0.85, normal * 0.24))
+        }
+
+        return normal
     }
 
     private func tick() {
@@ -618,7 +681,7 @@ final class PiPController: NSObject, ObservableObject {
             let shouldAutoAdvance = mode == .auto || mode == .hybrid || isBlankLine
 
             if shouldAutoAdvance {
-                let duration = currentLineDuration()
+                let duration = currentLineDuration(for: current)
                 var elapsed = max(0, now - segmentStartTime)
 
                 while elapsed >= duration {
@@ -704,49 +767,55 @@ final class PiPController: NSObject, ObservableObject {
         let normalizedTranscript = normalizeForMatching(transcript)
         guard !normalizedTranscript.isEmpty else { return }
 
-        // Voice mode is intentionally tolerant. Thai speech recognition can
-        // insert/remove spaces or slightly alter a few characters, so matching
-        // only the beginning of a sentence was too strict.
-        let searchEnd = min(currentIndex + 3, segments.count - 1)
-
-        for index in currentIndex...searchEnd {
-            let target = normalizeForMatching(segments[index])
-
-            if target.isEmpty {
-                continue
-            }
-
-            if voiceMatchScore(transcript: normalizedTranscript, target: target) >= voiceSensitivity {
-                lastMatchedTranscript = normalizedTranscript
-
-                // Jump to the segment after the best matched line. This lets
-                // Voice recover even if recognition lagged behind by one line.
-                currentIndex = min(index + 1, segments.count - 1)
-                progress = 0
-
-                if index >= segments.count - 1 {
-                    isRunning = false
-                    speechStatus = "จบสคริปต์"
-                } else {
-                    statusText = mode == .hybrid
-                        ? "Hybrid: Voice จับตำแหน่งสคริปต์แล้ว"
-                        : "Voice: ตามคำพูดแล้ว"
-                }
-
-                renderViews()
-                return
-            }
+        // SFSpeech partial results are cumulative. After one line advances,
+        // only new speech is eligible to advance the next line. This prevents
+        // one partial result from skipping 2–3 script lines.
+        if normalizedTranscript.count < voiceConsumedCharacters {
+            voiceConsumedCharacters = 0
         }
+
+        let start = normalizedTranscript.index(
+            normalizedTranscript.startIndex,
+            offsetBy: min(voiceConsumedCharacters, normalizedTranscript.count)
+        )
+        let freshTranscript = String(normalizedTranscript[start...])
+
+        let target = normalizeForMatching(segments[currentIndex])
+
+        // Blank lines are handled smoothly by the timer in Voice/Hybrid.
+        guard !target.isEmpty else { return }
+
+        let now = CACurrentMediaTime()
+        guard now - lastVoiceAdvanceAt >= 0.75 else { return }
+
+        let score = voiceMatchScore(
+            transcript: freshTranscript,
+            target: target,
+            anchorLength: voiceFocusLevel.anchorLength
+        )
+
+        guard score >= voiceFocusLevel.matchThreshold else { return }
+
+        lastMatchedTranscript = normalizedTranscript
+        voiceConsumedCharacters = normalizedTranscript.count
+        lastVoiceAdvanceAt = now
+
+        // Voice is deliberately allowed to move exactly ONE line per confirmed match.
+        advanceOneSegment(source: "voice")
     }
 
-    private func voiceMatchScore(transcript: String, target: String) -> Double {
-        guard !target.isEmpty else { return 0 }
+    private func voiceMatchScore(
+        transcript: String,
+        target: String,
+        anchorLength requestedAnchorLength: Int
+    ) -> Double {
+        guard !transcript.isEmpty, !target.isEmpty else { return 0 }
 
         if transcript.contains(target) {
             return 1.0
         }
 
-        let anchorLength = min(max(4, target.count / 5), 8)
+        let anchorLength = min(max(3, requestedAnchorLength), max(3, target.count))
         guard target.count >= anchorLength else {
             return transcript.contains(target) ? 1.0 : 0.0
         }
@@ -772,8 +841,7 @@ final class PiPController: NSObject, ObservableObject {
             }
         }
 
-        let denominator = max(1, uniqueStarts.count)
-        return Double(matchedAnchors) / Double(denominator)
+        return Double(matchedAnchors) / Double(max(1, uniqueStarts.count))
     }
 
     private func normalizeForMatching(_ text: String) -> String {
@@ -793,7 +861,7 @@ final class PiPController: NSObject, ObservableObject {
             segmentStartTime = CACurrentMediaTime()
             lastMatchedTranscript = ""
             if source == "voice" {
-                statusText = mode == .hybrid ? "Hybrid: Voice ข้ามไปช่วงถัดไป" : "Voice: ไปช่วงถัดไป"
+                statusText = mode == .hybrid ? "Hybrid: Voice จับบรรทัดถัดไป" : "Voice: จับบรรทัดถัดไป"
             }
         } else {
             progress = 0
