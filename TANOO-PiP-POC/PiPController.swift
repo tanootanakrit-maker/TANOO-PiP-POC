@@ -123,7 +123,7 @@ final class PiPController: NSObject, ObservableObject {
     @Published var fontSize: CGFloat = 44
     @Published var lineSpacing: CGFloat = 10
     @Published var autoSpeed: Double = 1.0
-    @Published var voiceSensitivity: Double = 0.65
+    @Published var voiceSensitivity: Double = 0.40
     @Published var verticalPosition: Double = 0.18
     @Published var backgroundOpacity: Double = 0.78
     @Published var textAlignment: PromptAlignment = .center
@@ -410,7 +410,7 @@ final class PiPController: NSObject, ObservableObject {
         backgroundOpacity = project.backgroundOpacity
         textAlignment = project.textAlignment
         textColorStyle = project.textColorStyle
-        voiceSensitivity = project.voiceSensitivity ?? 0.65
+        voiceSensitivity = project.voiceSensitivity ?? 0.40
         rebuildSegments(reset: true)
         modeDidChange()
         statusText = "โหลดโปรเจกต์ “\(project.name)” แล้ว"
@@ -545,21 +545,78 @@ final class PiPController: NSObject, ObservableObject {
         speechStatus = "ได้ยิน: \(transcript.suffix(60))"
 
         let normalizedTranscript = normalizeForMatching(transcript)
-        let target = normalizeForMatching(segments[currentIndex])
+        guard !normalizedTranscript.isEmpty else { return }
 
-        guard target.count >= 4 else { return }
+        // Voice mode is intentionally tolerant. Thai speech recognition can
+        // insert/remove spaces or slightly alter a few characters, so matching
+        // only the beginning of a sentence was too strict.
+        let searchEnd = min(currentIndex + 3, segments.count - 1)
 
-        let evidenceFraction = max(0.18, 0.52 - (voiceSensitivity * 0.36))
-        let prefixLength = min(max(5, Int(Double(target.count) * evidenceFraction)), 18)
-        let prefix = String(target.prefix(prefixLength))
+        for index in currentIndex...searchEnd {
+            let target = normalizeForMatching(segments[index])
 
-        let matched = normalizedTranscript.contains(prefix)
-            || (target.count <= 18 && normalizedTranscript.contains(target))
+            if target.isEmpty {
+                continue
+            }
 
-        if matched && normalizedTranscript != lastMatchedTranscript {
-            lastMatchedTranscript = normalizedTranscript
-            advanceOneSegment(source: "voice")
+            if voiceMatchScore(transcript: normalizedTranscript, target: target) >= voiceSensitivity {
+                lastMatchedTranscript = normalizedTranscript
+
+                // Jump to the segment after the best matched line. This lets
+                // Voice recover even if recognition lagged behind by one line.
+                currentIndex = min(index + 1, segments.count - 1)
+                progress = 0
+
+                if index >= segments.count - 1 {
+                    isRunning = false
+                    speechStatus = "จบสคริปต์"
+                } else {
+                    statusText = mode == .hybrid
+                        ? "Hybrid: Voice จับตำแหน่งสคริปต์แล้ว"
+                        : "Voice: ตามคำพูดแล้ว"
+                }
+
+                renderViews()
+                return
+            }
         }
+    }
+
+    private func voiceMatchScore(transcript: String, target: String) -> Double {
+        guard !target.isEmpty else { return 0 }
+
+        if transcript.contains(target) {
+            return 1.0
+        }
+
+        let anchorLength = min(max(4, target.count / 5), 8)
+        guard target.count >= anchorLength else {
+            return transcript.contains(target) ? 1.0 : 0.0
+        }
+
+        let chars = Array(target)
+        let starts = [
+            0,
+            max(0, chars.count / 4),
+            max(0, chars.count / 2),
+            max(0, (chars.count * 3) / 4),
+            max(0, chars.count - anchorLength)
+        ]
+
+        var matchedAnchors = 0
+        var uniqueStarts = Set<Int>()
+
+        for start in starts where uniqueStarts.insert(start).inserted {
+            let end = min(chars.count, start + anchorLength)
+            guard end > start else { continue }
+            let anchor = String(chars[start..<end])
+            if transcript.contains(anchor) {
+                matchedAnchors += 1
+            }
+        }
+
+        let denominator = max(1, uniqueStarts.count)
+        return Double(matchedAnchors) / Double(denominator)
     }
 
     private func normalizeForMatching(_ text: String) -> String {
