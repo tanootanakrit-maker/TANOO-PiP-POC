@@ -504,6 +504,18 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
+    private func prepareCameraAudioSession() {
+        do {
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(.playAndRecord, mode: .videoRecording, options: [])
+            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        } catch {
+            Task { @MainActor in
+                self.statusText = "ตั้งค่าเสียงกล้องไม่สำเร็จ: " + error.localizedDescription
+            }
+        }
+    }
+
     private func requestPermissionsAndConfigure() {
         let cameraStatus = AVCaptureDevice.authorizationStatus(for: .video)
         let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
@@ -544,6 +556,9 @@ final class CameraController: NSObject, ObservableObject {
             }
             return
         }
+
+        prepareCameraAudioSession()
+        session.automaticallyConfiguresApplicationAudioSession = false
 
         session.beginConfiguration()
         var configurationCommitted = false
@@ -823,6 +838,7 @@ final class CameraController: NSObject, ObservableObject {
     private func startRecording() {
         guard isConfigured, !movieOutput.isRecording else { return }
 
+        prepareCameraAudioSession()
         configureVideoConnection()
 
         let url = FileManager.default.temporaryDirectory
@@ -889,7 +905,10 @@ extension CameraController: AVCaptureFileOutputRecordingDelegate {
             self.recordingTimer = nil
 
             if let error {
-                self.statusText = "บันทึกวิดีโอผิดพลาด: " + error.localizedDescription
+                self.statusText = "REC ERROR: " + error.localizedDescription
+            } else if self.recordingSeconds < 0.5 {
+                self.statusText = "REC หยุดก่อน 1 วินาที — ตรวจระบบเสียง/Voice"
+                try? FileManager.default.removeItem(at: outputFileURL)
             } else {
                 self.saveVideoToPhotos(outputFileURL)
             }
