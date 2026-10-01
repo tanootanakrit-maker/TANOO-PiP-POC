@@ -35,6 +35,11 @@ enum CameraResolution: String, CaseIterable, Identifiable {
     }
 }
 
+private enum RecordingStopAction {
+    case finish
+    case pause
+}
+
 final class CameraController: NSObject, ObservableObject {
     let session = AVCaptureSession()
 
@@ -51,6 +56,7 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var diagnosticStage = 0
     @Published private(set) var isRunning = false
     @Published private(set) var isRecording = false
+    @Published private(set) var isPaused = false
     @Published private(set) var isStartingRecording = false
     @Published private(set) var isReconfiguring = false
     @Published private(set) var statusText = "กำลังเตรียมกล้อง…"
@@ -85,6 +91,9 @@ final class CameraController: NSObject, ObservableObject {
     private var currentDevice: AVCaptureDevice?
     private var recordingTimer: Timer?
     private var currentRecordingURL: URL?
+    private var recordingSegments: [URL] = []
+    private var stopAction: RecordingStopAction = .finish
+    private var resetDurationOnNextSegment = false
     private let speechBridge = CameraSpeechBridge()
 
     override init() {
@@ -407,6 +416,51 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
+    func enableAutoFocus() {
+        focusExposureLocked = false
+
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.currentDevice else { return }
+
+            do {
+                try device.lockForConfiguration()
+
+                if self.captureMode == .cinematic {
+                    if #available(iOS 26.0, *) {
+                        device.setCinematicVideoTrackingFocus(
+                            at: CGPoint(x: 0.5, y: 0.5),
+                            focusMode: .strong
+                        )
+                    }
+                } else {
+                    if device.isFocusPointOfInterestSupported {
+                        device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
+                    }
+                    if device.isFocusModeSupported(.continuousAutoFocus) {
+                        device.focusMode = .continuousAutoFocus
+                    }
+
+                    if device.isExposurePointOfInterestSupported {
+                        device.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5)
+                    }
+                    if device.isExposureModeSupported(.continuousAutoExposure) {
+                        device.exposureMode = .continuousAutoExposure
+                    }
+                }
+
+                device.unlockForConfiguration()
+
+                Task { @MainActor in
+                    self.statusText = "AUTO FOCUS"
+                }
+            } catch {
+                Task { @MainActor in
+                    self.statusText = "เปิด Auto Focus ไม่สำเร็จ: " + error.localizedDescription
+                }
+            }
+        }
+    }
+
     func focus(at devicePoint: CGPoint) {
         focusExposureLocked = false
 
@@ -517,7 +571,56 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func toggleRecording() {
-        isRecording ? stopRecording() : startRecording()
+        if isRecording {
+            finishRecording()
+        } else if isPaused {
+            resumeRecording()
+        } else {
+            startNewTake()
+        }
+    }
+
+    func startNewTake() {
+        guard !isRecording, !isStartingRecording, !isReconfiguring else { return }
+
+        cleanupTemporaryRecordings()
+        recordingSegments.removeAll()
+        currentRecordingURL = nil
+        recordingSeconds = 0
+        isPaused = false
+        stopAction = .finish
+        resetDurationOnNextSegment = true
+
+        startRecordingSegment()
+    }
+
+    func pauseRecording() {
+        guard movieOutput.isRecording else { return }
+        stopAction = .pause
+        statusText = "กำลัง Pause…"
+        movieOutput.stopRecording()
+    }
+
+    func resumeRecording() {
+        guard isPaused, !isRecording, !isStartingRecording, !isReconfiguring else { return }
+
+        isPaused = false
+        stopAction = .finish
+        resetDurationOnNextSegment = false
+        startRecordingSegment()
+    }
+
+    func finishRecording() {
+        stopSpeech()
+
+        if movieOutput.isRecording {
+            stopAction = .finish
+            statusText = "กำลังหยุดและรวมคลิป…"
+            movieOutput.stopRecording()
+        } else if isPaused {
+            isPaused = false
+            finalizeRecordingSegments()
+        }
     }
 
     func startSpeech() {
@@ -1020,16 +1123,17 @@ final class CameraController: NSObject, ObservableObject {
             includingPropertiesForKeys: nil
         ) else { return }
 
+        let preserved = Set(recordingSegments + [currentRecordingURL].compactMap { $0 })
+
         for file in files
         where file.lastPathComponent.hasPrefix("TANOO-") &&
               file.pathExtension.lowercased() == "mov" &&
-              file != currentRecordingURL {
+              !preserved.contains(file) {
             try? FileManager.default.removeItem(at: file)
         }
     }
 
-    private func startRecording() {
-        cleanupTemporaryRecordings()
+    private func startRecordingSegment() {
         refreshDiskSpace()
 
         let freeGB = freeDiskSpaceGB()
@@ -1041,6 +1145,7 @@ final class CameraController: NSObject, ObservableObject {
                 resolution.rawValue,
                 freeGB
             )
+            isPaused = !recordingSegments.isEmpty
             return
         }
 
@@ -1049,7 +1154,9 @@ final class CameraController: NSObject, ObservableObject {
               !isStartingRecording,
               !isReconfiguring,
               session.isRunning else {
-            statusText = isReconfiguring ? "รอเปลี่ยนคุณภาพกล้องให้เสร็จก่อน" : "กล้องยังไม่พร้อมบันทึก"
+            statusText = isReconfiguring
+                ? "รอเปลี่ยนคุณภาพกล้องให้เสร็จก่อน"
+                : "กล้องยังไม่พร้อมบันทึก"
             return
         }
 
@@ -1061,22 +1168,122 @@ final class CameraController: NSObject, ObservableObject {
             .appendingPathExtension("mov")
 
         currentRecordingURL = url
-        recordingSeconds = 0
         isStartingRecording = true
-        statusText = "กำลังเริ่ม REC…"
+        statusText = recordingSegments.isEmpty ? "กำลังเริ่ม REC…" : "กำลังบันทึกต่อ…"
 
         movieOutput.startRecording(to: url, recordingDelegate: self)
     }
 
-    private func stopRecording() {
-        guard movieOutput.isRecording else {
-            isStartingRecording = false
+    private func finalizeRecordingSegments() {
+        guard !recordingSegments.isEmpty else {
+            statusText = "ไม่มีคลิปสำหรับบันทึก"
             return
         }
-        movieOutput.stopRecording()
+
         recordingTimer?.invalidate()
         recordingTimer = nil
-        statusText = "กำลังปิดไฟล์วิดีโอ…"
+
+        if recordingSegments.count == 1, let url = recordingSegments.first {
+            recordingSegments.removeAll()
+            statusText = "กำลังบันทึกลง Photos…"
+            saveVideoToPhotos(url)
+            return
+        }
+
+        statusText = "กำลังรวมช่วงวิดีโอ…"
+
+        let segments = recordingSegments
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TANOO-MERGED-" + UUID().uuidString)
+            .appendingPathExtension("mov")
+
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+
+            let composition = AVMutableComposition()
+            guard let videoTrack = composition.addMutableTrack(
+                withMediaType: .video,
+                preferredTrackID: kCMPersistentTrackID_Invalid
+            ) else {
+                Task { @MainActor in
+                    self.statusText = "รวมคลิปไม่สำเร็จ: สร้าง Video Track ไม่ได้"
+                }
+                return
+            }
+
+            let audioTrack = composition.addMutableTrack(
+                withMediaType: .audio,
+                preferredTrackID: kCMPersistentTrackID_Invalid
+            )
+
+            var cursor = CMTime.zero
+            var preferredTransform: CGAffineTransform?
+
+            do {
+                for url in segments {
+                    let asset = AVURLAsset(url: url)
+                    guard let sourceVideo = asset.tracks(withMediaType: .video).first else { continue }
+                    let duration = asset.duration
+                    let range = CMTimeRange(start: .zero, duration: duration)
+
+                    try videoTrack.insertTimeRange(range, of: sourceVideo, at: cursor)
+                    if preferredTransform == nil {
+                        preferredTransform = sourceVideo.preferredTransform
+                    }
+
+                    if let sourceAudio = asset.tracks(withMediaType: .audio).first,
+                       let audioTrack {
+                        try audioTrack.insertTimeRange(range, of: sourceAudio, at: cursor)
+                    }
+
+                    cursor = CMTimeAdd(cursor, duration)
+                }
+
+                if let preferredTransform {
+                    videoTrack.preferredTransform = preferredTransform
+                }
+
+                guard let exporter = AVAssetExportSession(
+                    asset: composition,
+                    presetName: AVAssetExportPresetPassthrough
+                ) else {
+                    throw NSError(
+                        domain: "TANOO",
+                        code: 2001,
+                        userInfo: [NSLocalizedDescriptionKey: "สร้างระบบรวมวิดีโอไม่ได้"]
+                    )
+                }
+
+                exporter.outputURL = outputURL
+                exporter.outputFileType = .mov
+                exporter.shouldOptimizeForNetworkUse = false
+
+                exporter.exportAsynchronously { [weak self] in
+                    guard let self else { return }
+
+                    if exporter.status == .completed {
+                        for url in segments {
+                            try? FileManager.default.removeItem(at: url)
+                        }
+
+                        Task { @MainActor in
+                            self.recordingSegments.removeAll()
+                            self.statusText = "รวมคลิปแล้ว กำลังบันทึกลง Photos…"
+                            self.saveVideoToPhotos(outputURL)
+                        }
+                    } else {
+                        let message = exporter.error?.localizedDescription ?? "Unknown export error"
+                        Task { @MainActor in
+                            self.statusText = "รวมคลิปไม่สำเร็จ: " + message
+                        }
+                    }
+                }
+            } catch {
+                Task { @MainActor in
+                    self.statusText = "รวมคลิปไม่สำเร็จ: " + error.localizedDescription
+                }
+            }
+        }
     }
 
     private func saveVideoToPhotos(_ url: URL) {
