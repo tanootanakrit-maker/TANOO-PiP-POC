@@ -1923,15 +1923,18 @@ struct CameraStudioView: View {
                 .allowsHitTesting(false)
             }
 
-            VStack {
+            VStack(spacing: 8) {
                 Spacer()
 
                 if controlsExpanded {
                     expandedControls
                 } else {
-                    collapsedControls
+                    collapsedTools
                 }
+
+                recordDock
             }
+            .padding(.bottom, 4)
             .ignoresSafeArea(edges: .bottom)
         }
         .statusBarHidden(true)
@@ -1971,6 +1974,14 @@ struct CameraStudioView: View {
                 }
             }
         }
+        .onChange(of: camera.isPaused) { paused in
+            if paused {
+                camera.stopSpeech()
+                if teleprompter.isRunning {
+                    teleprompter.pause()
+                }
+            }
+        }
         .onChange(of: camera.resolution) { _ in
             if cameraStarted { camera.reconfigure() }
         }
@@ -2004,104 +2015,74 @@ struct CameraStudioView: View {
     }
 
     private var recordInfoBar: some View {
-        VStack(spacing: 4) {
-            HStack(spacing: 8) {
-                if camera.isRecording {
-                    HStack(spacing: 5) {
-                        Circle()
-                            .fill(Color.red)
-                            .frame(width: 8, height: 8)
-                        Text("REC " + formatDuration(camera.recordingSeconds))
-                            .foregroundStyle(.red)
-                            .fontWeight(.semibold)
-                    }
-                } else if camera.isStartingRecording {
-                    Text("กำลังเริ่ม REC…")
-                        .foregroundStyle(.orange)
+        HStack(spacing: 7) {
+            if camera.isRecording {
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(Color.red)
+                        .frame(width: 8, height: 8)
+                    Text("REC " + formatDuration(camera.recordingSeconds))
+                        .foregroundStyle(.red)
+                        .fontWeight(.semibold)
                 }
-
-                Spacer()
-
-                Text(camera.resolution.rawValue)
-                Text("·")
-                Text(String(Int(camera.frameRate)) + " FPS")
-                Text("·")
-                Text(String(format: "%.1f GB", camera.availableDiskGB))
-            }
-            .font(.caption2)
-
-            if camera.focusExposureLocked {
-                Text("AE/AF LOCK • แตะ 1 ครั้งเพื่อโฟกัสใหม่")
-                    .font(.caption2.bold())
+            } else if camera.isPaused {
+                Text("PAUSE " + formatDuration(camera.recordingSeconds))
                     .foregroundStyle(.yellow)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fontWeight(.semibold)
+            } else if camera.isStartingRecording {
+                Text("กำลังเริ่ม REC…")
+                    .foregroundStyle(.orange)
             }
+
+            Spacer()
+
+            Text(camera.resolution.rawValue)
+            Text("·")
+            Text(String(Int(camera.frameRate)) + " FPS")
+            Text("·")
+            Text(String(format: "%.1f GB", camera.availableDiskGB))
         }
+        .font(.caption2)
     }
 
-    private var collapsedControls: some View {
-        VStack(spacing: 7) {
-            recordInfoBar
-                .foregroundStyle(.white)
+    private var collapsedTools: some View {
+        HStack(spacing: 12) {
+            Button {
+                onOpenScript?()
+            } label: {
+                Image(systemName: "doc.text")
+            }
+            .disabled(activeTake)
 
-            HStack(spacing: 9) {
-                Button {
-                    onOpenScript?()
-                } label: {
-                    Image(systemName: "doc.text")
-                }
+            Button {
+                teleprompter.fontSize = max(12, teleprompter.fontSize - 2)
+            } label: {
+                Text("A−")
+            }
 
-                Button {
-                    teleprompter.fontSize = max(12, teleprompter.fontSize - 2)
-                } label: {
-                    Text("A−")
-                }
+            Text(String(Int(teleprompter.fontSize)))
+                .font(.caption.monospacedDigit())
+                .frame(minWidth: 26)
 
-                Text(String(Int(teleprompter.fontSize)))
-                    .font(.caption.monospacedDigit())
-                    .frame(minWidth: 24)
+            Button {
+                teleprompter.fontSize = min(68, teleprompter.fontSize + 2)
+            } label: {
+                Text("A+")
+            }
 
-                Button {
-                    teleprompter.fontSize = min(68, teleprompter.fontSize + 2)
-                } label: {
-                    Text("A+")
-                }
+            Spacer()
 
-                Button {
-                    controlsExpanded = true
-                } label: {
-                    Image(systemName: "chevron.up")
-                }
-
-                Spacer()
-
-                if countdownRemaining != nil {
-                    Button("ยกเลิก") {
-                        cancelCountdown()
-                    }
-                    .foregroundStyle(.orange)
-                } else {
-                    Button {
-                        recordButtonPressed()
-                    } label: {
-                        HStack(spacing: 6) {
-                            Circle()
-                                .fill(camera.isRecording ? Color.white : Color.red)
-                                .frame(width: 18, height: 18)
-                            Text(camera.isRecording ? "STOP" : "REC")
-                                .fontWeight(.semibold)
-                        }
-                    }
-                    .disabled(!recordButtonAvailable)
-                }
+            Button {
+                controlsExpanded = true
+            } label: {
+                Label("เครื่องมือ", systemImage: "chevron.up")
             }
         }
         .foregroundStyle(.white)
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
-        .background(.black.opacity(0.80), in: RoundedRectangle(cornerRadius: 16))
+        .background(.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 15))
         .padding(.horizontal, 8)
-        .padding(.bottom, 4)
     }
 
     private var expandedControls: some View {
@@ -2113,6 +2094,7 @@ struct CameraStudioView: View {
                     } label: {
                         Label("Script", systemImage: "doc.text")
                     }
+                    .disabled(activeTake)
 
                     Spacer()
 
@@ -2130,6 +2112,20 @@ struct CameraStudioView: View {
                 }
                 .pickerStyle(.segmented)
 
+                if teleprompter.mode != .auto {
+                    HStack(spacing: 8) {
+                        Text("Focus Voice")
+                            .font(.caption2)
+
+                        Picker("Focus Voice", selection: $teleprompter.voiceFocusLevel) {
+                            ForEach(VoiceFocusLevel.allCases) { level in
+                                Text(level.title).tag(level)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                    }
+                }
+
                 HStack(spacing: 8) {
                     Picker("Resolution", selection: $camera.resolution) {
                         Text("1080p").tag(CameraResolution.hd1080)
@@ -2143,7 +2139,13 @@ struct CameraStudioView: View {
                     }
                     .pickerStyle(.segmented)
                 }
-                .disabled(!cameraStarted || camera.isRecording || camera.isStartingRecording || camera.isReconfiguring)
+                .disabled(
+                    !cameraStarted ||
+                    camera.isRecording ||
+                    camera.isPaused ||
+                    camera.isStartingRecording ||
+                    camera.isReconfiguring
+                )
 
                 HStack(spacing: 8) {
                     Text("Countdown")
@@ -2171,7 +2173,7 @@ struct CameraStudioView: View {
                         teleprompter.toggleRunning()
                     } label: {
                         Label(
-                            teleprompter.isRunning ? "Pause" : "Start",
+                            teleprompter.isRunning ? "Pause Text" : "Start Text",
                             systemImage: teleprompter.isRunning ? "pause.fill" : "play.fill"
                         )
                         .frame(maxWidth: .infinity)
@@ -2206,7 +2208,7 @@ struct CameraStudioView: View {
 
                     Text(String(Int(teleprompter.fontSize)))
                         .font(.caption.monospacedDigit())
-                        .frame(minWidth: 24)
+                        .frame(minWidth: 26)
 
                     Button {
                         teleprompter.fontSize = min(68, teleprompter.fontSize + 2)
@@ -2248,39 +2250,25 @@ struct CameraStudioView: View {
                 }
                 .disabled(!cameraStarted)
 
-                Text("แตะภาพ = Focus • กดค้าง = AE/AF Lock")
+                HStack(spacing: 8) {
+                    Button {
+                        camera.enableAutoFocus()
+                    } label: {
+                        Label("AF AUTO", systemImage: "viewfinder")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Text(camera.focusExposureLocked ? "AE/AF LOCK" : "Auto / Tap Focus")
+                        .font(.caption2.bold())
+                        .foregroundStyle(camera.focusExposureLocked ? .yellow : .secondary)
+                        .frame(maxWidth: .infinity)
+                }
+
+                Text("แตะภาพ 1 ครั้ง = Focus • กดค้าง = AE/AF LOCK • กด AF AUTO เพื่อกลับเป็น Continuous Auto Focus")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
-
-                recordInfoBar
-
-                if countdownRemaining != nil {
-                    Button("ยกเลิกนับถอยหลัง") {
-                        cancelCountdown()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.orange)
-                    .frame(maxWidth: .infinity)
-                } else {
-                    Button {
-                        recordButtonPressed()
-                    } label: {
-                        HStack(spacing: 10) {
-                            Circle()
-                                .fill(camera.isRecording ? Color.white : Color.red)
-                                .frame(width: 22, height: 22)
-
-                            Text(camera.isRecording ? "STOP RECORDING" : "REC")
-                                .font(.headline.bold())
-                        }
-                        .foregroundStyle(camera.isRecording ? .black : .white)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 11)
-                        .background(Color.red, in: RoundedRectangle(cornerRadius: 14))
-                    }
-                    .disabled(!recordButtonAvailable)
-                }
 
                 Text(camera.statusText)
                     .font(.caption2)
@@ -2296,24 +2284,119 @@ struct CameraStudioView: View {
             }
             .padding(11)
         }
-        .frame(maxHeight: 410)
+        .frame(maxHeight: 370)
         .background(.ultraThinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 18))
         .padding(.horizontal, 6)
-        .padding(.bottom, 3)
     }
 
-    private var recordButtonAvailable: Bool {
-        cameraStarted &&
-        camera.isConfigured &&
-        !camera.isReconfiguring &&
-        !camera.isStartingRecording
+    private var recordDock: some View {
+        VStack(spacing: 7) {
+            recordInfoBar
+                .foregroundStyle(.white)
+                .padding(.horizontal, 14)
+
+            ZStack {
+                HStack {
+                    Group {
+                        if camera.isRecording {
+                            Button {
+                                pauseVideo()
+                            } label: {
+                                Image(systemName: "pause.fill")
+                                    .font(.title3.bold())
+                                    .frame(width: 52, height: 52)
+                                    .background(.white.opacity(0.17), in: Circle())
+                            }
+                            .accessibilityLabel("Pause Recording")
+                        } else if camera.isPaused {
+                            Button {
+                                resumeVideo()
+                            } label: {
+                                Image(systemName: "play.fill")
+                                    .font(.title3.bold())
+                                    .frame(width: 52, height: 52)
+                                    .background(.white.opacity(0.17), in: Circle())
+                            }
+                            .accessibilityLabel("Resume Recording")
+                        } else {
+                            Color.clear.frame(width: 52, height: 52)
+                        }
+                    }
+
+                    Spacer()
+
+                    Button {
+                        controlsExpanded.toggle()
+                    } label: {
+                        Image(systemName: controlsExpanded ? "chevron.down" : "slider.horizontal.3")
+                            .font(.headline.bold())
+                            .frame(width: 52, height: 52)
+                            .background(.white.opacity(0.14), in: Circle())
+                    }
+                }
+
+                Button {
+                    shutterPressed()
+                } label: {
+                    ZStack {
+                        Circle()
+                            .stroke(.white, lineWidth: 5)
+                            .frame(width: 78, height: 78)
+
+                        if camera.isRecording || camera.isPaused {
+                            RoundedRectangle(cornerRadius: 7)
+                                .fill(Color.red)
+                                .frame(width: 34, height: 34)
+                        } else {
+                            Circle()
+                                .fill(Color.red)
+                                .frame(width: 62, height: 62)
+                        }
+                    }
+                    .contentShape(Circle())
+                }
+                .disabled(!shutterEnabled)
+                .opacity(shutterEnabled ? 1 : 0.45)
+                .accessibilityLabel(
+                    camera.isRecording || camera.isPaused
+                        ? "Stop Recording"
+                        : "Start Recording"
+                )
+            }
+            .frame(height: 82)
+            .padding(.horizontal, 26)
+        }
+        .padding(.top, 8)
+        .padding(.bottom, 6)
+        .background(.black.opacity(0.86))
     }
 
-    private func recordButtonPressed() {
-        if camera.isRecording {
+    private var activeTake: Bool {
+        camera.isRecording || camera.isPaused || camera.isStartingRecording
+    }
+
+    private var shutterEnabled: Bool {
+        if camera.isRecording || camera.isPaused {
+            return true
+        }
+
+        return cameraStarted &&
+            camera.isConfigured &&
+            !camera.isReconfiguring &&
+            !camera.isStartingRecording
+    }
+
+    private func shutterPressed() {
+        if camera.isRecording || camera.isPaused {
+            countdownToken = UUID()
+            countdownRemaining = nil
+            camera.finishRecording()
             camera.stopSpeech()
-            camera.toggleRecording()
+
+            if teleprompter.isRunning {
+                teleprompter.pause()
+            }
             return
         }
 
@@ -2343,24 +2426,39 @@ struct CameraStudioView: View {
         }
     }
 
+    private func pauseVideo() {
+        camera.stopSpeech()
+        camera.pauseRecording()
+
+        if teleprompter.isRunning {
+            teleprompter.pause()
+        }
+    }
+
+    private func resumeVideo() {
+        camera.resumeRecording()
+    }
+
     private func cancelCountdown() {
         countdownToken = UUID()
         countdownRemaining = nil
     }
 
     private func beginRecording() {
-        guard recordButtonAvailable else { return }
+        guard shutterEnabled else { return }
 
         if teleprompter.isRunning {
             teleprompter.pause()
         }
         teleprompter.resetPosition()
 
-        camera.toggleRecording()
+        camera.startNewTake()
 
+        // If recording never reaches didStartRecording, keep the prompt stopped.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
             if !camera.isRecording &&
                !camera.isStartingRecording &&
+               !camera.isPaused &&
                teleprompter.isRunning {
                 teleprompter.pause()
             }
