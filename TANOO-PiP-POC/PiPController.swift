@@ -55,6 +55,22 @@ enum VoiceFocusLevel: String, Codable, CaseIterable, Identifiable {
         case .high: return 6
         }
     }
+
+    var maxLookAhead: Int {
+        switch self {
+        case .low: return 2
+        case .normal: return 2
+        case .high: return 1
+        }
+    }
+
+    var lookAheadExtraThreshold: Double {
+        switch self {
+        case .low: return 0.10
+        case .normal: return 0.12
+        case .high: return 0.10
+        }
+    }
 }
 
 enum PromptAlignment: String, Codable, CaseIterable, Identifiable {
@@ -397,6 +413,47 @@ final class PiPController: NSObject, ObservableObject {
         lastMatchedTranscript = ""
         voiceConsumedCharacters = 0
         lastVoiceAdvanceAt = 0
+        renderViews()
+    }
+
+    func autoFormatScriptLines() {
+        let normalized = scriptText
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+
+        let targetLength = max(
+            18,
+            min(54, Int(34.0 * (44.0 / max(Double(fontSize), 12.0))))
+        )
+
+        let sourceLines = normalized.components(separatedBy: "\n")
+        var output: [String] = []
+
+        for sourceLine in sourceLines {
+            let line = sourceLine.trimmingCharacters(in: .whitespaces)
+
+            if line.isEmpty {
+                output.append("")
+                continue
+            }
+
+            let sentences = Self.splitSentencesPreservingText(line)
+
+            for sentence in sentences {
+                output.append(
+                    contentsOf: Self.wrapOnlyAtExistingSpaces(
+                        sentence,
+                        targetLength: targetLength
+                    )
+                )
+            }
+        }
+
+        // Only whitespace/newlines are reorganized. Characters, words,
+        // punctuation, numbers and spelling are never rewritten.
+        scriptText = output.joined(separator: "\n")
+        rebuildSegments(reset: true)
+        exportStatus = "Auto แบ่งบรรทัดแล้ว — ไม่แก้คำในสคริปต์"
         renderViews()
     }
 
@@ -759,6 +816,12 @@ final class PiPController: NSObject, ObservableObject {
         )
     }
 
+    private struct VoiceMatchResult {
+        let score: Double
+        let startOffset: Int
+        let endOffset: Int
+    }
+
     private func handleTranscript(_ transcript: String) {
         guard isRunning, mode != .auto, currentIndex < segments.count else { return }
 
@@ -767,123 +830,462 @@ final class PiPController: NSObject, ObservableObject {
         let normalizedTranscript = normalizeForMatching(transcript)
         guard !normalizedTranscript.isEmpty else { return }
 
-        // SFSpeech partial results are cumulative. After one line advances,
-        // only new speech is eligible to advance the next line. This prevents
-        // one partial result from skipping 2–3 script lines.
+        // Speech partial results are cumulative and can be revised.
         if normalizedTranscript.count < voiceConsumedCharacters {
             voiceConsumedCharacters = 0
         }
 
-        let start = normalizedTranscript.index(
-            normalizedTranscript.startIndex,
-            offsetBy: min(voiceConsumedCharacters, normalizedTranscript.count)
-        )
-        let freshTranscript = String(normalizedTranscript[start...])
-
-        let target = normalizeForMatching(segments[currentIndex])
-
-        // Blank lines are handled smoothly by the timer in Voice/Hybrid.
-        guard !target.isEmpty else { return }
-
+        var consumed = min(voiceConsumedCharacters, normalizedTranscript.count)
+        var advancesThisResult = 0
+        let maxAdvancesPerResult = 3
         let now = CACurrentMediaTime()
-        guard now - lastVoiceAdvanceAt >= 0.75 else { return }
 
-        let score = voiceMatchScore(
-            transcript: freshTranscript,
-            target: target,
-            anchorLength: voiceFocusLevel.anchorLength
-        )
+        while currentIndex < segments.count,
+              advancesThisResult < maxAdvancesPerResult {
+            let currentRaw = segments[currentIndex]
+            let currentTarget = normalizeForMatching(currentRaw)
 
-        guard score >= voiceFocusLevel.matchThreshold else { return }
+            // Intentional blank lines are animated by the fast smooth blank timer.
+            if currentTarget.isEmpty {
+                break
+            }
 
-        lastMatchedTranscript = normalizedTranscript
-        voiceConsumedCharacters = normalizedTranscript.count
-        lastVoiceAdvanceAt = now
+            let startIndex = normalizedTranscript.index(
+                normalizedTranscript.startIndex,
+                offsetBy: consumed
+            )
+            var fresh = String(normalizedTranscript[startIndex...])
 
-        // Voice is deliberately allowed to move exactly ONE line per confirmed match.
-        advanceOneSegment(source: "voice")
+            // Bound fuzzy work without losing recent speech.
+            if fresh.count > 260 {
+                fresh = String(fresh.suffix(260))
+                consumed = max(0, normalizedTranscript.count - fresh.count)
+            }
+
+            guard !fresh.isEmpty else { break }
+
+            let currentMatch = bestVoiceMatch(
+                transcript: fresh,
+                target: currentTarget
+            )
+
+            if currentMatch.score >= voiceFocusLevel.matchThreshold,
+               now - lastVoiceAdvanceAt >= 0.35 {
+                consumed += currentMatch.endOffset
+                voiceConsumedCharacters = min(consumed, normalizedTranscript.count)
+                lastMatchedTranscript = normalizedTranscript
+                lastVoiceAdvanceAt = now
+
+                advanceOneSegment(source: "voice")
+                advancesThisResult += 1
+                continue
+            }
+
+            // If the speaker is faster than the displayed script, allow
+            // catching up to a clearly recognized NEXT line. This is stricter
+            // than current-line matching and never performs an unverified jump.
+            var catchUp: (index: Int, match: VoiceMatchResult)?
+
+            if voiceFocusLevel.maxLookAhead > 0 {
+                let lastIndex = min(
+                    segments.count - 1,
+                    currentIndex + voiceFocusLevel.maxLookAhead
+                )
+
+                if currentIndex < lastIndex {
+                    for index in (currentIndex + 1)...lastIndex {
+                        let candidateTarget = normalizeForMatching(segments[index])
+                        if candidateTarget.isEmpty { continue }
+
+                        let candidate = bestVoiceMatch(
+                            transcript: fresh,
+                            target: candidateTarget
+                        )
+
+                        let distance = index - currentIndex
+                        let required = min(
+                            0.96,
+                            voiceFocusLevel.matchThreshold
+                                + voiceFocusLevel.lookAheadExtraThreshold
+                                + Double(max(0, distance - 1)) * 0.04
+                        )
+
+                        if candidate.score >= required,
+                           candidate.score >= currentMatch.score + 0.12 {
+                            if catchUp == nil || candidate.score > catchUp!.match.score {
+                                catchUp = (index, candidate)
+                            }
+                        }
+                    }
+                }
+            }
+
+            guard let catchUp,
+                  now - lastVoiceAdvanceAt >= 0.35 else {
+                break
+            }
+
+            consumed += catchUp.match.endOffset
+            voiceConsumedCharacters = min(consumed, normalizedTranscript.count)
+            lastMatchedTranscript = normalizedTranscript
+            lastVoiceAdvanceAt = now
+
+            // The recognized line was already spoken, so move EyeLine to
+            // the line immediately after it. This is deliberate catch-up.
+            currentIndex = min(catchUp.index + 1, segments.count - 1)
+            progress = 0
+            segmentStartTime = CACurrentMediaTime()
+            statusText = "Voice: ตามคำพูดที่เร็วกว่า Script แล้ว"
+            renderViews()
+
+            advancesThisResult += 1
+            break
+        }
     }
 
-    private func voiceMatchScore(
+    private func bestVoiceMatch(
         transcript: String,
-        target: String,
-        anchorLength requestedAnchorLength: Int
-    ) -> Double {
-        guard !transcript.isEmpty, !target.isEmpty else { return 0 }
-
-        if transcript.contains(target) {
-            return 1.0
+        target: String
+    ) -> VoiceMatchResult {
+        guard !transcript.isEmpty, !target.isEmpty else {
+            return VoiceMatchResult(score: 0, startOffset: 0, endOffset: 0)
         }
 
-        let anchorLength = min(max(3, requestedAnchorLength), max(3, target.count))
-        guard target.count >= anchorLength else {
-            return transcript.contains(target) ? 1.0 : 0.0
+        if let range = transcript.range(of: target) {
+            return VoiceMatchResult(
+                score: 1,
+                startOffset: transcript.distance(
+                    from: transcript.startIndex,
+                    to: range.lowerBound
+                ),
+                endOffset: transcript.distance(
+                    from: transcript.startIndex,
+                    to: range.upperBound
+                )
+            )
         }
 
-        let chars = Array(target)
-        let starts = [
-            0,
-            max(0, chars.count / 4),
-            max(0, chars.count / 2),
-            max(0, (chars.count * 3) / 4),
-            max(0, chars.count - anchorLength)
-        ]
+        let source = Array(transcript)
+        let targetChars = Array(target)
+        let targetCount = targetChars.count
 
-        var matchedAnchors = 0
-        var uniqueStarts = Set<Int>()
+        guard targetCount >= 2 else {
+            return VoiceMatchResult(score: transcript.contains(target) ? 1 : 0, startOffset: 0, endOffset: transcript.count)
+        }
 
-        for start in starts where uniqueStarts.insert(start).inserted {
-            let end = min(chars.count, start + anchorLength)
-            guard end > start else { continue }
-            let anchor = String(chars[start..<end])
-            if transcript.contains(anchor) {
-                matchedAnchors += 1
+        let minimumWindow = max(2, Int(Double(targetCount) * 0.62))
+        let maximumWindow = min(
+            source.count,
+            max(minimumWindow, Int(Double(targetCount) * 1.42) + 4)
+        )
+
+        guard source.count >= minimumWindow else {
+            let score = fuzzySimilarity(
+                Array(source),
+                targetChars
+            )
+            return VoiceMatchResult(
+                score: score,
+                startOffset: 0,
+                endOffset: source.count
+            )
+        }
+
+        var best = VoiceMatchResult(score: 0, startOffset: 0, endOffset: 0)
+
+        for windowLength in minimumWindow...maximumWindow {
+            let maxStart = source.count - windowLength
+            if maxStart < 0 { continue }
+
+            for start in 0...maxStart {
+                let end = start + windowLength
+                let window = Array(source[start..<end])
+                let score = fuzzySimilarity(window, targetChars)
+
+                if score > best.score {
+                    best = VoiceMatchResult(
+                        score: score,
+                        startOffset: start,
+                        endOffset: end
+                    )
+                }
             }
         }
 
-        return Double(matchedAnchors) / Double(max(1, uniqueStarts.count))
+        return best
+    }
+
+    private func fuzzySimilarity(
+        _ source: [Character],
+        _ target: [Character]
+    ) -> Double {
+        guard !source.isEmpty, !target.isEmpty else { return 0 }
+
+        let lcs = longestCommonSubsequenceLength(source, target)
+        let lcsCoverage = Double(lcs) / Double(target.count)
+
+        let sourceBigrams = characterNGrams(source, size: 2)
+        let targetBigrams = characterNGrams(target, size: 2)
+
+        let bigramCoverage: Double
+        if targetBigrams.isEmpty {
+            bigramCoverage = lcsCoverage
+        } else {
+            bigramCoverage = Double(
+                targetBigrams.intersection(sourceBigrams).count
+            ) / Double(targetBigrams.count)
+        }
+
+        let lengthDifference = abs(source.count - target.count)
+        let lengthPenalty = max(
+            0.76,
+            1.0 - Double(lengthDifference) / Double(max(source.count, target.count)) * 0.28
+        )
+
+        return min(
+            1,
+            (lcsCoverage * 0.64 + bigramCoverage * 0.36) * lengthPenalty
+        )
+    }
+
+    private func longestCommonSubsequenceLength(
+        _ a: [Character],
+        _ b: [Character]
+    ) -> Int {
+        guard !a.isEmpty, !b.isEmpty else { return 0 }
+
+        var previous = Array(repeating: 0, count: b.count + 1)
+
+        for charA in a {
+            var current = Array(repeating: 0, count: b.count + 1)
+
+            for j in 1...b.count {
+                if charA == b[j - 1] {
+                    current[j] = previous[j - 1] + 1
+                } else {
+                    current[j] = max(previous[j], current[j - 1])
+                }
+            }
+
+            previous = current
+        }
+
+        return previous[b.count]
+    }
+
+    private func characterNGrams(
+        _ characters: [Character],
+        size: Int
+    ) -> Set<String> {
+        guard size > 0, characters.count >= size else { return [] }
+
+        var grams = Set<String>()
+        for start in 0...(characters.count - size) {
+            grams.insert(String(characters[start..<(start + size)]))
+        }
+        return grams
     }
 
     private func normalizeForMatching(_ text: String) -> String {
-        let lowered = text.lowercased()
-        let allowed = lowered.unicodeScalars.filter {
+        let numberCanonical = canonicalizeNumbers(in: text.lowercased())
+        let allowed = numberCanonical.unicodeScalars.filter {
             CharacterSet.letters.contains($0) || CharacterSet.decimalDigits.contains($0)
         }
         return String(String.UnicodeScalarView(allowed))
     }
 
-    private func advanceOneSegment(source: String) {
-        guard !segments.isEmpty else { return }
+    private func canonicalizeNumbers(in text: String) -> String {
+        let thaiDigits: [Character: Character] = [
+            "๐": "0", "๑": "1", "๒": "2", "๓": "3", "๔": "4",
+            "๕": "5", "๖": "6", "๗": "7", "๘": "8", "๙": "9"
+        ]
 
-        if currentIndex < segments.count - 1 {
-            currentIndex += 1
-            progress = 0
-            segmentStartTime = CACurrentMediaTime()
-            lastMatchedTranscript = ""
-            if source == "voice" {
-                statusText = mode == .hybrid ? "Hybrid: Voice จับบรรทัดถัดไป" : "Voice: จับบรรทัดถัดไป"
-            }
-        } else {
-            progress = 0
-            segmentStartTime = CACurrentMediaTime()
-            isRunning = false
-            speechTracker.stop()
-            statusText = "จบสคริปต์"
+        let digitNormalized = String(text.map { thaiDigits[$0] ?? $0 })
+        let pattern = #"[0-9][0-9,]*(?:\.[0-9]+)?"#
+
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return digitNormalized
         }
 
-        renderViews()
+        let ns = digitNormalized as NSString
+        let matches = regex.matches(
+            in: digitNormalized,
+            range: NSRange(location: 0, length: ns.length)
+        )
+
+        var output = digitNormalized
+
+        for match in matches.reversed() {
+            let token = ns.substring(with: match.range)
+            let replacement = thaiWordsForNumberToken(token)
+            let range = Range(match.range, in: output)!
+
+            output.replaceSubrange(range, with: replacement)
+        }
+
+        return output
     }
 
-    private func rebuildSegments(reset: Bool) {
-        let oldIndex = currentIndex
-        segments = segmentScript(scriptText)
+    private func thaiWordsForNumberToken(_ token: String) -> String {
+        let clean = token.replacingOccurrences(of: ",", with: "")
+        let parts = clean.split(separator: ".", omittingEmptySubsequences: false)
 
-        if reset {
-            currentIndex = 0
-            progress = 0
-        } else {
-            currentIndex = min(oldIndex, max(segments.count - 1, 0))
+        guard let integer = Int(parts.first ?? "0") else {
+            return token
         }
+
+        var result = thaiIntegerWords(integer)
+
+        if parts.count > 1 {
+            let decimalDigits = String(parts[1])
+            let digitWords = [
+                "0": "ศูนย์", "1": "หนึ่ง", "2": "สอง", "3": "สาม", "4": "สี่",
+                "5": "ห้า", "6": "หก", "7": "เจ็ด", "8": "แปด", "9": "เก้า"
+            ]
+
+            result += "จุด"
+            for character in decimalDigits {
+                result += digitWords[String(character)] ?? String(character)
+            }
+        }
+
+        return result
+    }
+
+    private func thaiIntegerWords(_ value: Int) -> String {
+        if value == 0 { return "ศูนย์" }
+        if value < 0 { return "ลบ" + thaiIntegerWords(abs(value)) }
+
+        if value >= 1_000_000 {
+            let millions = value / 1_000_000
+            let remainder = value % 1_000_000
+            return thaiIntegerWords(millions)
+                + "ล้าน"
+                + (remainder == 0 ? "" : thaiIntegerWords(remainder))
+        }
+
+        let digits = [
+            100_000: "แสน",
+            10_000: "หมื่น",
+            1_000: "พัน",
+            100: "ร้อย"
+        ]
+
+        var remainder = value
+        var result = ""
+
+        for (place, unit) in digits.sorted(by: { $0.key > $1.key }) {
+            let digit = remainder / place
+            if digit > 0 {
+                result += thaiDigitWord(digit)
+                result += unit
+                remainder %= place
+            }
+        }
+
+        let tens = remainder / 10
+        let ones = remainder % 10
+
+        if tens > 0 {
+            if tens == 1 {
+                result += "สิบ"
+            } else if tens == 2 {
+                result += "ยี่สิบ"
+            } else {
+                result += thaiDigitWord(tens) + "สิบ"
+            }
+        }
+
+        if ones > 0 {
+            if ones == 1 && value > 10 {
+                result += "เอ็ด"
+            } else {
+                result += thaiDigitWord(ones)
+            }
+        }
+
+        return result
+    }
+
+    private func thaiDigitWord(_ value: Int) -> String {
+        switch value {
+        case 0: return "ศูนย์"
+        case 1: return "หนึ่ง"
+        case 2: return "สอง"
+        case 3: return "สาม"
+        case 4: return "สี่"
+        case 5: return "ห้า"
+        case 6: return "หก"
+        case 7: return "เจ็ด"
+        case 8: return "แปด"
+        case 9: return "เก้า"
+        default: return String(value)
+        }
+    }
+
+
+    private static func splitSentencesPreservingText(_ text: String) -> [String] {
+        var result: [String] = []
+        var buffer = ""
+
+        for character in text {
+            buffer.append(character)
+
+            if character == "." ||
+               character == "!" ||
+               character == "?" ||
+               character == "。" ||
+               character == "！" ||
+               character == "？" {
+                let sentence = buffer.trimmingCharacters(in: .whitespaces)
+                if !sentence.isEmpty {
+                    result.append(sentence)
+                }
+                buffer = ""
+            }
+        }
+
+        let tail = buffer.trimmingCharacters(in: .whitespaces)
+        if !tail.isEmpty {
+            result.append(tail)
+        }
+
+        return result.isEmpty ? [text] : result
+    }
+
+    private static func wrapOnlyAtExistingSpaces(
+        _ text: String,
+        targetLength: Int
+    ) -> [String] {
+        let words = text.split(
+            whereSeparator: { $0.isWhitespace }
+        ).map(String.init)
+
+        // Thai text often has no spaces between words. Never cut the text
+        // arbitrarily because that could split a real word.
+        guard words.count > 1 else {
+            return [text.trimmingCharacters(in: .whitespaces)]
+        }
+
+        var result: [String] = []
+        var current = ""
+
+        for word in words {
+            let candidate = current.isEmpty ? word : current + " " + word
+
+            if candidate.count > targetLength && !current.isEmpty {
+                result.append(current)
+                current = word
+            } else {
+                current = candidate
+            }
+        }
+
+        if !current.isEmpty {
+            result.append(current)
+        }
+
+        return result
     }
 
     private func segmentScript(_ script: String) -> [String] {
@@ -965,14 +1367,9 @@ final class PiPController: NSObject, ObservableObject {
             return chunks
         }
 
-        var chunks: [String] = []
-        var index = trimmed.startIndex
-        while index < trimmed.endIndex {
-            let end = trimmed.index(index, offsetBy: targetLength, limitedBy: trimmed.endIndex) ?? trimmed.endIndex
-            chunks.append(String(trimmed[index..<end]))
-            index = end
-        }
-        return chunks
+        // No safe whitespace boundary exists. Keep the wording intact and
+        // let SwiftUI wrap it visually instead of cutting through Thai words.
+        return [trimmed]
     }
 
     private func renderViews() {
