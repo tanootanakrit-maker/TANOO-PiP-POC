@@ -39,8 +39,12 @@ final class CameraController: NSObject, ObservableObject {
     let session = AVCaptureSession()
 
     @Published var captureMode: CameraCaptureMode = .video
-    @Published var resolution: CameraResolution = .hd1080
-    @Published var frameRate: Double = 30
+    @Published var resolution: CameraResolution = .hd1080 {
+        didSet { UserDefaults.standard.set(resolution.rawValue, forKey: "TANOO.camera.resolution") }
+    }
+    @Published var frameRate: Double = 30 {
+        didSet { UserDefaults.standard.set(frameRate, forKey: "TANOO.camera.frameRate") }
+    }
 
     @Published private(set) var isConfigured = false
     @Published private(set) var isPreviewOnly = false
@@ -51,6 +55,7 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var isReconfiguring = false
     @Published private(set) var statusText = "กำลังเตรียมกล้อง…"
     @Published private(set) var recordingSeconds: TimeInterval = 0
+    @Published private(set) var availableDiskGB: Double = 0
 
     @Published private(set) var cinematicAvailable = false
     @Published private(set) var proAvailable = false
@@ -81,6 +86,21 @@ final class CameraController: NSObject, ObservableObject {
     private var recordingTimer: Timer?
     private var currentRecordingURL: URL?
     private let speechBridge = CameraSpeechBridge()
+
+    override init() {
+        if let raw = UserDefaults.standard.string(forKey: "TANOO.camera.resolution"),
+           let savedResolution = CameraResolution(rawValue: raw) {
+            resolution = savedResolution
+        }
+
+        if UserDefaults.standard.object(forKey: "TANOO.camera.frameRate") != nil {
+            let savedFPS = UserDefaults.standard.double(forKey: "TANOO.camera.frameRate")
+            frameRate = savedFPS > 0 ? savedFPS : 30
+        }
+
+        super.init()
+        refreshDiskSpace()
+    }
 
     func diagnosticDetectFrontCamera() {
         statusText = "STEP 1: กำลังค้นหากล้องหน้า…"
@@ -388,6 +408,8 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func focus(at devicePoint: CGPoint) {
+        focusExposureLocked = false
+
         sessionQueue.async { [weak self] in
             guard let self, let device = self.currentDevice else { return }
             do {
@@ -402,8 +424,11 @@ final class CameraController: NSObject, ObservableObject {
                         device.focusPointOfInterest = devicePoint
                         if device.isFocusModeSupported(.continuousAutoFocus) {
                             device.focusMode = .continuousAutoFocus
+                        } else if device.isFocusModeSupported(.autoFocus) {
+                            device.focusMode = .autoFocus
                         }
                     }
+
                     if device.isExposurePointOfInterestSupported {
                         device.exposurePointOfInterest = devicePoint
                         if device.isExposureModeSupported(.continuousAutoExposure) {
@@ -413,9 +438,79 @@ final class CameraController: NSObject, ObservableObject {
                 }
 
                 device.unlockForConfiguration()
+
+                Task { @MainActor in
+                    self.statusText = "Focus จุดที่แตะแล้ว"
+                }
             } catch {
                 Task { @MainActor in
                     self.statusText = "แตะ Focus ไม่สำเร็จ: " + error.localizedDescription
+                }
+            }
+        }
+    }
+
+    func lockFocus(at devicePoint: CGPoint) {
+        focusExposureLocked = true
+
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.currentDevice else { return }
+
+            do {
+                try device.lockForConfiguration()
+
+                if self.captureMode == .cinematic {
+                    if #available(iOS 26.0, *) {
+                        device.setCinematicVideoFixedFocus(at: devicePoint, focusMode: .strong)
+                    }
+                } else {
+                    if device.isFocusPointOfInterestSupported {
+                        device.focusPointOfInterest = devicePoint
+                    }
+                    if device.isFocusModeSupported(.autoFocus) {
+                        device.focusMode = .autoFocus
+                    }
+
+                    if device.isExposurePointOfInterestSupported {
+                        device.exposurePointOfInterest = devicePoint
+                    }
+                    if device.isExposureModeSupported(.autoExpose) {
+                        device.exposureMode = .autoExpose
+                    }
+                }
+
+                device.unlockForConfiguration()
+
+                if self.captureMode != .cinematic {
+                    self.sessionQueue.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+                        guard let self, let device = self.currentDevice else { return }
+                        do {
+                            try device.lockForConfiguration()
+                            if device.isFocusModeSupported(.locked) {
+                                device.focusMode = .locked
+                            }
+                            if device.isExposureModeSupported(.locked) {
+                                device.exposureMode = .locked
+                            }
+                            device.unlockForConfiguration()
+
+                            Task { @MainActor in
+                                self.statusText = "AE/AF LOCK"
+                            }
+                        } catch {
+                            Task { @MainActor in
+                                self.statusText = "ล็อก Focus ไม่สำเร็จ: " + error.localizedDescription
+                            }
+                        }
+                    }
+                } else {
+                    Task { @MainActor in
+                        self.statusText = "Cinematic Focus LOCK"
+                    }
+                }
+            } catch {
+                Task { @MainActor in
+                    self.statusText = "ล็อก Focus ไม่สำเร็จ: " + error.localizedDescription
                 }
             }
         }
@@ -902,7 +997,53 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
+    private func freeDiskSpaceGB() -> Double {
+        let path = FileManager.default.temporaryDirectory.path
+        guard let attrs = try? FileManager.default.attributesOfFileSystem(forPath: path),
+              let free = attrs[.systemFreeSize] as? NSNumber else {
+            return 0
+        }
+        return free.doubleValue / 1_073_741_824.0
+    }
+
+    private func refreshDiskSpace() {
+        let value = freeDiskSpaceGB()
+        Task { @MainActor in
+            self.availableDiskGB = value
+        }
+    }
+
+    private func cleanupTemporaryRecordings() {
+        let directory = FileManager.default.temporaryDirectory
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ) else { return }
+
+        for file in files
+        where file.lastPathComponent.hasPrefix("TANOO-") &&
+              file.pathExtension.lowercased() == "mov" &&
+              file != currentRecordingURL {
+            try? FileManager.default.removeItem(at: file)
+        }
+    }
+
     private func startRecording() {
+        cleanupTemporaryRecordings()
+        refreshDiskSpace()
+
+        let freeGB = freeDiskSpaceGB()
+        let minimumGB = resolution == .uhd4K ? 2.0 : 1.0
+
+        guard freeGB >= minimumGB else {
+            statusText = String(
+                format: "พื้นที่ไม่พอสำหรับ %@ — เหลือ %.1f GB",
+                resolution.rawValue,
+                freeGB
+            )
+            return
+        }
+
         guard isConfigured,
               !movieOutput.isRecording,
               !isStartingRecording,
@@ -941,6 +1082,8 @@ final class CameraController: NSObject, ObservableObject {
     private func saveVideoToPhotos(_ url: URL) {
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
             guard status == .authorized || status == .limited else {
+                try? FileManager.default.removeItem(at: url)
+                self?.refreshDiskSpace()
                 Task { @MainActor in
                     self?.statusText = "วิดีโอถ่ายสำเร็จ แต่ไม่ได้รับสิทธิ์บันทึกลง Photos"
                 }
@@ -958,6 +1101,7 @@ final class CameraController: NSObject, ObservableObject {
                     }
                 }
                 try? FileManager.default.removeItem(at: url)
+                self?.refreshDiskSpace()
             }
         }
     }
