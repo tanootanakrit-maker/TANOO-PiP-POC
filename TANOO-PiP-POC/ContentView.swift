@@ -4,6 +4,8 @@ import UIKit
 
 struct TeleprompterSetupView: View {
     @ObservedObject var teleprompter: PiPController
+    var onOpenCamera: (() -> Void)? = nil
+    @FocusState private var scriptEditorFocused: Bool
     @State private var showingProjects = false
     @State private var showingExporter = false
     @State private var exportDocument = TeleprompterTextDocument(text: "")
@@ -23,6 +25,34 @@ struct TeleprompterSetupView: View {
             }
             .navigationTitle("TANOO Teleprompter")
             .navigationBarTitleDisplayMode(.inline)
+            .scrollDismissesKeyboard(.interactively)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    if let onOpenCamera {
+                        Button {
+                            scriptEditorFocused = false
+                            DispatchQueue.main.async {
+                                onOpenCamera()
+                            }
+                        } label: {
+                            Label("Camera", systemImage: "video.fill")
+                        }
+                    }
+                }
+
+                ToolbarItemGroup(placement: .keyboard) {
+                    Button("Camera") {
+                        scriptEditorFocused = false
+                        DispatchQueue.main.async {
+                            onOpenCamera?()
+                        }
+                    }
+                    Spacer()
+                    Button("ปิดแป้นพิมพ์") {
+                        scriptEditorFocused = false
+                    }
+                }
+            }
             .sheet(isPresented: $showingProjects) {
                 SavedProjectsView(controller: teleprompter)
             }
@@ -83,6 +113,7 @@ struct TeleprompterSetupView: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
                 TextEditor(text: $teleprompter.scriptText)
+                    .focused($scriptEditorFocused)
                     .font(.body)
                     .frame(minHeight: 190)
                     .padding(6)
@@ -238,9 +269,14 @@ struct TeleprompterSetupView: View {
                     title: "ความทึบพื้นหลัง",
                     valueText: "\(Int(teleprompter.backgroundOpacity * 100))%",
                     value: $teleprompter.backgroundOpacity,
-                    range: 0.35...1.0,
+                    range: 0.0...1.0,
                     step: 0.05
                 )
+
+                Text("พื้นหลัง 0% = จางที่สุด • 100% = เข้มที่สุด")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
                 VStack(alignment: .leading, spacing: 6) {
                     Text("การจัดข้อความ")
