@@ -864,7 +864,7 @@ final class PiPController: NSObject, ObservableObject {
             }
 
             for part in sentenceParts {
-                result.append(contentsOf: chunk(part, targetLength: targetLength))
+                result.append(contentsOf: Self.chunk(part, targetLength: targetLength))
             }
         }
 
