@@ -248,13 +248,18 @@ struct TeleprompterSetupView: View {
                 )
 
                 if teleprompter.mode != .auto {
-                    sliderRow(
-                        title: "Voice Sensitivity",
-                        valueText: "\(Int(teleprompter.voiceSensitivity * 100))%",
-                        value: $teleprompter.voiceSensitivity,
-                        range: 0.35...0.85,
-                        step: 0.05
-                    )
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Focus Voice")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        Picker("Focus Voice", selection: $teleprompter.voiceFocusLevel) {
+                            ForEach(VoiceFocusLevel.allCases) { level in
+                                Text(level.title).tag(level)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                    }
                 }
 
                 sliderRow(
