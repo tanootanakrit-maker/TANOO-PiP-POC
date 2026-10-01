@@ -1175,15 +1175,23 @@ extension CameraController: AVCaptureAudioDataOutputSampleBufferDelegate {
 final class CameraSpeechBridge {
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "th-TH"))
     private let lock = NSLock()
+
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var active = false
+    private var restarting = false
+
+    private var statusHandler: ((String) -> Void)?
+    private var transcriptHandler: ((String) -> Void)?
 
     func start(
         onStatus: @escaping (String) -> Void,
         onTranscript: @escaping (String) -> Void
     ) {
-        stop()
+        lock.lock()
+        statusHandler = onStatus
+        transcriptHandler = onTranscript
+        lock.unlock()
 
         SFSpeechRecognizer.requestAuthorization { [weak self] status in
             guard let self else { return }
@@ -1192,32 +1200,77 @@ final class CameraSpeechBridge {
                 return
             }
 
-            guard let recognizer = self.recognizer, recognizer.isAvailable else {
-                onStatus("Speech Recognition ยังไม่พร้อม")
-                return
+            self.beginRecognitionIfPossible()
+        }
+    }
+
+    private func beginRecognitionIfPossible() {
+        lock.lock()
+        if active || restarting {
+            lock.unlock()
+            return
+        }
+        restarting = true
+        let onStatus = statusHandler
+        let onTranscript = transcriptHandler
+        lock.unlock()
+
+        guard let recognizer, recognizer.isAvailable else {
+            lock.lock()
+            restarting = false
+            lock.unlock()
+            onStatus?("Speech Recognition ยังไม่พร้อม")
+            return
+        }
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        request.taskHint = .dictation
+
+        lock.lock()
+        recognitionRequest = request
+        active = true
+        restarting = false
+        lock.unlock()
+
+        recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+            guard let self else { return }
+
+            if let result {
+                onTranscript?(result.bestTranscription.formattedString)
+
+                if result.isFinal {
+                    self.restartSoon(reason: "Voice ต่อช่วงการฟังอัตโนมัติ")
+                }
             }
 
-            let request = SFSpeechAudioBufferRecognitionRequest()
-            request.shouldReportPartialResults = true
-            request.taskHint = .dictation
-
-            self.lock.lock()
-            self.recognitionRequest = request
-            self.active = true
-            self.lock.unlock()
-
-            self.recognitionTask = recognizer.recognitionTask(with: request) { result, error in
-                if let result {
-                    onTranscript(result.bestTranscription.formattedString)
-                }
-                if error != nil {
-                    self.lock.lock()
-                    self.active = false
-                    self.lock.unlock()
-                }
+            if error != nil {
+                self.restartSoon(reason: "Voice กำลังเชื่อมต่อใหม่…")
             }
+        }
 
-            onStatus("Hybrid/Voice ใช้เสียงจาก TANOO Camera")
+        onStatus?("Voice กำลังฟังภาษาไทย")
+    }
+
+    private func restartSoon(reason: String) {
+        lock.lock()
+        guard active else {
+            lock.unlock()
+            return
+        }
+
+        active = false
+        recognitionRequest?.endAudio()
+        recognitionTask?.cancel()
+        recognitionRequest = nil
+        recognitionTask = nil
+        let onStatus = statusHandler
+        lock.unlock()
+
+        onStatus?(reason)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.beginRecognitionIfPossible()
         }
     }
 
@@ -1225,16 +1278,23 @@ final class CameraSpeechBridge {
         lock.lock()
         let request = active ? recognitionRequest : nil
         lock.unlock()
+
         request?.appendAudioSampleBuffer(sampleBuffer)
     }
 
     func stop() {
         lock.lock()
         active = false
+        restarting = false
+
         let request = recognitionRequest
         recognitionRequest = nil
+
         let task = recognitionTask
         recognitionTask = nil
+
+        statusHandler = nil
+        transcriptHandler = nil
         lock.unlock()
 
         request?.endAudio()
