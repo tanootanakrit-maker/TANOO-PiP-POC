@@ -1076,38 +1076,184 @@ final class PreviewView: UIView {
     }
 }
 
-private struct CameraTeleprompterOverlayView: UIViewRepresentable {
-    let controller: PiPController
-
-    func makeUIView(context: Context) -> TeleprompterVideoView {
-        let view = TeleprompterVideoView()
-        DispatchQueue.main.async {
-            controller.attachCameraOverlay(view)
+private extension PromptAlignment {
+    var swiftUITextAlignment: TextAlignment {
+        switch self {
+        case .left: return .leading
+        case .center: return .center
+        case .right: return .trailing
         }
-        return view
     }
 
-    func updateUIView(_ uiView: TeleprompterVideoView, context: Context) {
-        uiView.render(snapshot: controller.snapshot())
-    }
-
-    static func dismantleUIView(_ uiView: TeleprompterVideoView, coordinator: ()) {
+    var swiftUIFrameAlignment: Alignment {
+        switch self {
+        case .left: return .leading
+        case .center: return .center
+        case .right: return .trailing
+        }
     }
 }
 
-private struct CameraTeleprompterOverlay: UIViewRepresentable {
-    let controller: PiPController
+private struct CameraPromptContent: View {
+    let snapshot: TeleprompterSnapshot
+    let size: CGSize
 
-    func makeUIView(context: Context) -> TeleprompterVideoView {
-        let view = TeleprompterVideoView()
-        DispatchQueue.main.async {
-            controller.attachCameraOverlay(view)
+    var body: some View {
+        let scale = max(0.72, min(1.15, size.width / 360.0))
+        let fontSize = max(20, snapshot.fontSize * scale)
+        let rowHeight = max(48, fontSize * 1.55 + snapshot.lineSpacing)
+        let current = max(0, min(snapshot.currentIndex, max(snapshot.segments.count - 1, 0)))
+        let positionAdjustment = size.height * CGFloat(snapshot.verticalPosition - 0.18) * 0.35
+
+        ZStack {
+            Color.black.opacity(snapshot.backgroundOpacity)
+
+            VStack(spacing: 0) {
+                ForEach(0..<5, id: \.self) { offset in
+                    let index = current + offset
+
+                    if index < snapshot.segments.count {
+                        let value = snapshot.segments[index]
+                        let alpha = offset == 0 ? 1.0 : max(0.42, 0.80 - Double(offset) * 0.12)
+
+                        Text(value.isEmpty ? " " : value)
+                            .font(.system(
+                                size: fontSize,
+                                weight: offset == 0 ? .semibold : .regular
+                            ))
+                            .foregroundStyle(Color(snapshot.textColor.uiColor).opacity(alpha))
+                            .multilineTextAlignment(snapshot.alignment.swiftUITextAlignment)
+                            .lineSpacing(snapshot.lineSpacing)
+                            .frame(
+                                maxWidth: .infinity,
+                                minHeight: rowHeight,
+                                alignment: snapshot.alignment.swiftUIFrameAlignment
+                            )
+                            .padding(.horizontal, 12)
+                    } else {
+                        Color.clear
+                            .frame(height: rowHeight)
+                    }
+                }
+            }
+            .offset(
+                y: positionAdjustment - CGFloat(snapshot.progress) * rowHeight
+            )
         }
-        return view
+        .clipped()
+    }
+}
+
+private struct MovableResizableTeleprompter: View {
+    @ObservedObject var controller: PiPController
+
+    @State private var centerXRatio: CGFloat = 0.5
+    @State private var centerYRatio: CGFloat = 0.30
+    @State private var widthRatio: CGFloat = 0.92
+    @State private var boxHeight: CGFloat = 190
+
+    @State private var moveStart: CGPoint?
+    @State private var resizeStart: CGSize?
+
+    var body: some View {
+        GeometryReader { geo in
+            let width = max(220, min(geo.size.width * widthRatio, geo.size.width - 16))
+            let height = max(110, min(boxHeight, geo.size.height * 0.58))
+            let centerX = clamp(
+                centerXRatio * geo.size.width,
+                lower: width / 2 + 8,
+                upper: geo.size.width - width / 2 - 8
+            )
+            let centerY = clamp(
+                centerYRatio * geo.size.height,
+                lower: height / 2 + 8,
+                upper: geo.size.height - height / 2 - 8
+            )
+
+            TimelineView(.periodic(from: Date(), by: 0.05)) { _ in
+                CameraPromptContent(
+                    snapshot: controller.snapshot(),
+                    size: CGSize(width: width, height: height)
+                )
+            }
+            .frame(width: width, height: height)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay {
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(.white.opacity(0.32), lineWidth: 1)
+                    .allowsHitTesting(false)
+            }
+            .overlay(alignment: .topLeading) {
+                Label("ย้าย", systemImage: "arrow.up.and.down.and.arrow.left.and.right")
+                    .font(.caption2.bold())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(.black.opacity(0.68), in: Capsule())
+                    .padding(6)
+                    .gesture(
+                        DragGesture()
+                            .onChanged { value in
+                                if moveStart == nil {
+                                    moveStart = CGPoint(x: centerXRatio, y: centerYRatio)
+                                }
+
+                                guard let moveStart else { return }
+                                centerXRatio = clamp(
+                                    moveStart.x + value.translation.width / max(geo.size.width, 1),
+                                    lower: 0,
+                                    upper: 1
+                                )
+                                centerYRatio = clamp(
+                                    moveStart.y + value.translation.height / max(geo.size.height, 1),
+                                    lower: 0,
+                                    upper: 1
+                                )
+                            }
+                            .onEnded { _ in
+                                moveStart = nil
+                            }
+                    )
+            }
+            .overlay(alignment: .bottomTrailing) {
+                Label("ขยาย", systemImage: "arrow.up.left.and.down.right")
+                    .font(.caption2.bold())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(.black.opacity(0.68), in: Capsule())
+                    .padding(6)
+                    .gesture(
+                        DragGesture()
+                            .onChanged { value in
+                                if resizeStart == nil {
+                                    resizeStart = CGSize(width: widthRatio, height: boxHeight)
+                                }
+
+                                guard let resizeStart else { return }
+                                widthRatio = clamp(
+                                    resizeStart.width + value.translation.width / max(geo.size.width, 1),
+                                    lower: 0.55,
+                                    upper: 0.98
+                                )
+                                boxHeight = clamp(
+                                    resizeStart.height + value.translation.height,
+                                    lower: 110,
+                                    upper: geo.size.height * 0.58
+                                )
+                            }
+                            .onEnded { _ in
+                                resizeStart = nil
+                            }
+                    )
+            }
+            .position(x: centerX, y: centerY)
+        }
+        .allowsHitTesting(true)
     }
 
-    func updateUIView(_ uiView: TeleprompterVideoView, context: Context) {
-        uiView.render(snapshot: controller.snapshot())
+    private func clamp(_ value: CGFloat, lower: CGFloat, upper: CGFloat) -> CGFloat {
+        min(max(value, lower), max(lower, upper))
     }
 }
 
@@ -1199,12 +1345,12 @@ struct CameraStudioView: View {
                     .padding(.horizontal, 10)
                     .padding(.top, 8)
 
-                    CameraTeleprompterOverlay(controller: teleprompter)
-                        .frame(height: 205)
-                        .clipShape(RoundedRectangle(cornerRadius: 14))
-                        .padding(.horizontal, 10)
-                        .padding(.top, 12)
+                    Spacer()
+                }
 
+                MovableResizableTeleprompter(controller: teleprompter)
+
+                VStack {
                     Spacer()
 
                     if camera.isRecording {
@@ -1279,7 +1425,6 @@ struct CameraStudioView: View {
 
                     Button {
                         teleprompter.toggleRunning()
-                        syncSpeech()
                     } label: {
                         Label(
                             teleprompter.isRunning ? "Pause" : "Start",
@@ -1329,19 +1474,7 @@ struct CameraStudioView: View {
                 }
 
                 Button {
-                    let wasRecording = camera.isRecording
-
-                    if !wasRecording && !teleprompter.isRunning {
-                        teleprompter.start()
-                    }
-
-                    syncSpeech()
-                    camera.toggleRecording()
-
-                    if wasRecording && teleprompter.isRunning {
-                        teleprompter.pause()
-                        camera.stopSpeech()
-                    }
+                    recordButtonPressed()
                 } label: {
                     HStack(spacing: 10) {
                         Circle()
@@ -1370,7 +1503,7 @@ struct CameraStudioView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
-                Text("แตะบนภาพเพื่อโฟกัส • Teleprompter เป็น Overlay บนหน้าจอและไม่ถูกฝังลงในไฟล์วิดีโอ • บรรทัดว่างใน Script จะคงอยู่เป็นจังหวะพูด")
+                Text("กรอบ Teleprompter: ลาก “ย้าย” เพื่อเปลี่ยนตำแหน่ง และลาก “ขยาย” ที่มุมขวาล่างเพื่อปรับขนาด • ข้อความไม่ถูกฝังลงไฟล์วิดีโอ")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1378,6 +1511,32 @@ struct CameraStudioView: View {
             .padding(12)
         }
         .background(Color(uiColor: .systemBackground))
+    }
+
+    private func recordButtonPressed() {
+        if camera.isRecording {
+            camera.stopSpeech()
+            camera.toggleRecording()
+
+            if teleprompter.isRunning {
+                teleprompter.pause()
+            }
+            return
+        }
+
+        if !teleprompter.isRunning {
+            teleprompter.start()
+        }
+
+        camera.toggleRecording()
+
+        if teleprompter.mode != .auto {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                if camera.isRecording {
+                    camera.startSpeech()
+                }
+            }
+        }
     }
 
     private func statusBadge(_ text: String) -> some View {
@@ -1408,16 +1567,16 @@ struct CameraStudioView: View {
     }
 
     private func syncSpeech() {
-        guard cameraStarted, camera.isConfigured else {
+        guard cameraStarted,
+              camera.isConfigured,
+              camera.isRecording,
+              teleprompter.isRunning,
+              teleprompter.mode != .auto else {
             camera.stopSpeech()
             return
         }
 
-        if teleprompter.isRunning && teleprompter.mode != .auto {
-            camera.startSpeech()
-        } else {
-            camera.stopSpeech()
-        }
+        camera.startSpeech()
     }
 
     private func formatDuration(_ seconds: TimeInterval) -> String {
@@ -1426,21 +1585,34 @@ struct CameraStudioView: View {
     }
 }
 
+private enum TANOOAppTab: Hashable {
+    case camera
+    case script
+}
+
 struct ContentView: View {
     @StateObject private var teleprompter = PiPController()
     @StateObject private var camera = CameraController()
+    @State private var selectedTab: TANOOAppTab = .camera
 
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             CameraStudioView(camera: camera, teleprompter: teleprompter)
+                .tag(TANOOAppTab.camera)
                 .tabItem {
                     Label("Camera", systemImage: "video.fill")
                 }
 
-            TeleprompterSetupView(teleprompter: teleprompter)
-                .tabItem {
-                    Label("Script", systemImage: "text.alignleft")
+            TeleprompterSetupView(
+                teleprompter: teleprompter,
+                onOpenCamera: {
+                    selectedTab = .camera
                 }
+            )
+            .tag(TANOOAppTab.script)
+            .tabItem {
+                Label("Script", systemImage: "text.alignleft")
+            }
         }
     }
 }
