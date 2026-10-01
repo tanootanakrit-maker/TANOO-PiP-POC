@@ -1427,16 +1427,27 @@ final class CameraController: NSObject, ObservableObject {
             }
             var cursor = CMTime.zero
             var instructions: [AVMutableVideoCompositionInstruction] = []
+            var originalTransform: CGAffineTransform?
+            var originalSize: CGSize?
+            var requiresRendering = false
             do {
                 for url in segments {
                     let asset = AVURLAsset(url: url)
                     guard let source = asset.tracks(withMediaType: .video).first else {
                         throw NSError(domain: "TANOO", code: 2001, userInfo: [NSLocalizedDescriptionKey: "ช็อตไม่มีวิดีโอ"])
                     }
+                    if let originalTransform, let originalSize {
+                        if originalTransform != source.preferredTransform || originalSize != source.naturalSize {
+                            requiresRendering = true
+                        }
+                    } else {
+                        originalTransform = source.preferredTransform
+                        originalSize = source.naturalSize
+                    }
                     let range = source.timeRange
                     try videoTrack.insertTimeRange(range, of: source, at: cursor)
                     if let audio = asset.tracks(withMediaType: .audio).first {
-                        let overlap = CMTimeRangeGetIntersection(range, audio.timeRange)
+                        let overlap = CMTimeRangeGetIntersection(range, otherRange: audio.timeRange)
                         if overlap.duration > .zero {
                             try audioTrack.insertTimeRange(overlap, of: audio,
                                 at: CMTimeAdd(cursor, CMTimeSubtract(overlap.start, range.start)))
@@ -1457,10 +1468,12 @@ final class CameraController: NSObject, ObservableObject {
                 videoComposition.renderSize = renderSize
                 videoComposition.frameDuration = CMTime(value: 1, timescale: max(1, fps))
                 videoComposition.instructions = instructions
-                guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
+                if !requiresRendering, let originalTransform { videoTrack.preferredTransform = originalTransform }
+                let preset = requiresRendering ? AVAssetExportPresetHighestQuality : AVAssetExportPresetPassthrough
+                guard let exporter = AVAssetExportSession(asset: composition, presetName: preset) else {
                     throw NSError(domain: "TANOO", code: 2002, userInfo: [NSLocalizedDescriptionKey: "สร้างระบบรวมช็อตไม่ได้"])
                 }
-                exporter.videoComposition = videoComposition
+                if requiresRendering { exporter.videoComposition = videoComposition }
                 exporter.outputURL = outputURL
                 exporter.outputFileType = .mov
                 exporter.exportAsynchronously {
