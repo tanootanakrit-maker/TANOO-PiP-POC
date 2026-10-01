@@ -62,6 +62,7 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var statusText = "กำลังเตรียมกล้อง…"
     @Published private(set) var recordingSeconds: TimeInterval = 0
     @Published private(set) var availableDiskGB: Double = 0
+    @Published private(set) var recordPreflightMessage: String = ""
 
     @Published private(set) var cinematicAvailable = false
     @Published private(set) var proAvailable = false
@@ -581,17 +582,65 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func startNewTake() {
-        guard !isRecording, !isStartingRecording, !isReconfiguring else { return }
+        guard !isRecording, !isStartingRecording, !isReconfiguring else {
+            let message = isReconfiguring
+                ? "REC ยังไม่เริ่ม: กล้องกำลังเปลี่ยนคุณภาพ"
+                : "REC ยังไม่เริ่ม: กล้องยังไม่พร้อม"
+            recordPreflightMessage = message
+            statusText = message
+            return
+        }
 
         cleanupTemporaryRecordings()
+        refreshDiskSpace()
+
+        let freeGB = freeDiskSpaceGB()
+        let minimumGB = resolution == .uhd4K ? 2.0 : 1.0
+
+        guard freeGB >= minimumGB else {
+            let message = String(
+                format: "พื้นที่ไม่พอ: %@ ต้องเหลืออย่างน้อย %.1f GB • ตอนนี้ %.1f GB",
+                resolution.rawValue,
+                minimumGB,
+                freeGB
+            )
+            availableDiskGB = freeGB
+            recordPreflightMessage = message
+            statusText = message
+            return
+        }
+
+        recordPreflightMessage = ""
         recordingSegments.removeAll()
         currentRecordingURL = nil
         recordingSeconds = 0
         isPaused = false
         stopAction = .finish
         resetDurationOnNextSegment = true
+        isStartingRecording = true
+        statusText = "กำลังเตรียม REC…"
 
-        startRecordingSegment()
+        // All AVCaptureSession / MovieFileOutput operations are serialized
+        // on the same queue. This removes the race that could happen after
+        // countdown, format changes or a previous take.
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+
+            if !self.session.isRunning {
+                self.session.startRunning()
+            }
+
+            guard self.session.isRunning else {
+                Task { @MainActor in
+                    self.isStartingRecording = false
+                    self.recordPreflightMessage = "REC ไม่เริ่ม: Capture Session ไม่ทำงาน"
+                    self.statusText = self.recordPreflightMessage
+                }
+                return
+            }
+
+            self.startRecordingSegmentOnSessionQueue()
+        }
     }
 
     func pauseRecording() {
@@ -607,7 +656,26 @@ final class CameraController: NSObject, ObservableObject {
         isPaused = false
         stopAction = .finish
         resetDurationOnNextSegment = false
-        startRecordingSegment()
+        isStartingRecording = true
+
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+
+            if !self.session.isRunning {
+                self.session.startRunning()
+            }
+
+            guard self.session.isRunning else {
+                Task { @MainActor in
+                    self.isStartingRecording = false
+                    self.recordPreflightMessage = "บันทึกต่อไม่ได้: Capture Session ไม่ทำงาน"
+                    self.statusText = self.recordPreflightMessage
+                }
+                return
+            }
+
+            self.startRecordingSegmentOnSessionQueue()
+        }
     }
 
     func finishRecording() {
@@ -1137,30 +1205,15 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
-    private func startRecordingSegment() {
-        refreshDiskSpace()
-
-        let freeGB = freeDiskSpaceGB()
-        let minimumGB = resolution == .uhd4K ? 2.0 : 1.0
-
-        guard freeGB >= minimumGB else {
-            statusText = String(
-                format: "พื้นที่ไม่พอสำหรับ %@ — เหลือ %.1f GB",
-                resolution.rawValue,
-                freeGB
-            )
-            isPaused = !recordingSegments.isEmpty
-            return
-        }
-
-        guard isConfigured,
-              !movieOutput.isRecording,
-              !isStartingRecording,
-              !isReconfiguring,
-              session.isRunning else {
-            statusText = isReconfiguring
-                ? "รอเปลี่ยนคุณภาพกล้องให้เสร็จก่อน"
-                : "กล้องยังไม่พร้อมบันทึก"
+    private func startRecordingSegmentOnSessionQueue() {
+        guard !movieOutput.isRecording, !isReconfiguring, session.isRunning else {
+            Task { @MainActor in
+                self.isStartingRecording = false
+                self.recordPreflightMessage = self.isReconfiguring
+                    ? "REC ยังไม่เริ่ม: รอเปลี่ยนคุณภาพกล้องให้เสร็จก่อน"
+                    : "REC ยังไม่เริ่ม: กล้องยังไม่พร้อมบันทึก"
+                self.statusText = self.recordPreflightMessage
+            }
             return
         }
 
@@ -1172,8 +1225,13 @@ final class CameraController: NSObject, ObservableObject {
             .appendingPathExtension("mov")
 
         currentRecordingURL = url
-        isStartingRecording = true
-        statusText = recordingSegments.isEmpty ? "กำลังเริ่ม REC…" : "กำลังบันทึกต่อ…"
+
+        Task { @MainActor in
+            self.recordPreflightMessage = ""
+            self.statusText = self.recordingSegments.isEmpty
+                ? "กำลังเริ่ม REC…"
+                : "กำลังบันทึกต่อ…"
+        }
 
         movieOutput.startRecording(to: url, recordingDelegate: self)
     }
@@ -1328,6 +1386,7 @@ extension CameraController: AVCaptureFileOutputRecordingDelegate {
             self.isStartingRecording = false
             self.isRecording = true
             self.isPaused = false
+            self.recordPreflightMessage = ""
 
             if self.resetDurationOnNextSegment {
                 self.recordingSeconds = 0
@@ -1365,7 +1424,8 @@ extension CameraController: AVCaptureFileOutputRecordingDelegate {
                 try? FileManager.default.removeItem(at: outputFileURL)
                 self.refreshDiskSpace()
                 self.isPaused = !self.recordingSegments.isEmpty
-                self.statusText = "REC ERROR: " + error.localizedDescription
+                self.recordPreflightMessage = "REC ERROR: " + error.localizedDescription
+                self.statusText = self.recordPreflightMessage
             } else {
                 self.recordingSegments.append(outputFileURL)
 
@@ -2302,6 +2362,18 @@ struct CameraStudioView: View {
                 .foregroundStyle(.white)
                 .padding(.horizontal, 14)
 
+            if !camera.recordPreflightMessage.isEmpty {
+                Text(camera.recordPreflightMessage)
+                    .font(.caption.bold())
+                    .foregroundStyle(.yellow)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 14)
+            } else if camera.isStartingRecording {
+                Text("กำลังเตรียม REC…")
+                    .font(.caption.bold())
+                    .foregroundStyle(.orange)
+            }
+
             ZStack {
                 HStack {
                     Group {
@@ -2354,6 +2426,10 @@ struct CameraStudioView: View {
                             RoundedRectangle(cornerRadius: 7)
                                 .fill(Color.red)
                                 .frame(width: 34, height: 34)
+                        } else if countdownRemaining != nil {
+                            Circle()
+                                .fill(Color.orange)
+                                .frame(width: 62, height: 62)
                         } else {
                             Circle()
                                 .fill(Color.red)
