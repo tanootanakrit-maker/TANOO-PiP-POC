@@ -8,6 +8,7 @@ enum CameraCaptureMode: String, CaseIterable, Identifiable {
     case cinematic
     case video
     case pro
+    case proRes
     case raw
 
     var id: String { rawValue }
@@ -17,6 +18,7 @@ enum CameraCaptureMode: String, CaseIterable, Identifiable {
         case .cinematic: return "CINE"
         case .video: return "VIDEO"
         case .pro: return "PRO"
+        case .proRes: return "ProRes"
         case .raw: return "RAW"
         }
     }
@@ -34,6 +36,22 @@ enum CameraResolution: String, CaseIterable, Identifiable {
         }
     }
 }
+
+// BEGIN MANUAL CAMERA MATH
+private enum ManualCameraMath {
+    static func exposureSeconds(denominator: Double, minimum: Double, maximum: Double, frameSeconds: Double) -> Double {
+        let low = minimum.isFinite && minimum > 0 ? minimum : 0.000001
+        let frame = frameSeconds.isFinite && frameSeconds > 0 ? frameSeconds : 1.0 / 30
+        let high = max(low, min(maximum.isFinite && maximum > 0 ? maximum : frame, frame))
+        let desired = denominator.isFinite && denominator > 0 ? 1 / denominator : high
+        return min(max(desired, low), high)
+    }
+    static func gain(_ value: Float, maximum: Float) -> Float {
+        let high = maximum.isFinite ? max(1, maximum) : 1
+        return value.isFinite ? min(max(value, 1), high) : 1
+    }
+}
+// END MANUAL CAMERA MATH
 
 // BEGIN CAMERA GEOMETRY
 private enum CameraGeometry {
@@ -92,6 +110,24 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var portraitActive = false
     @Published private(set) var cinematicAvailable = false
     @Published private(set) var proAvailable = false
+    @Published private(set) var proResAvailable = false
+    @Published private(set) var manualExposureSupported = false
+    @Published private(set) var manualFocusSupported = false
+    @Published private(set) var manualWBSupported = false
+    @Published private(set) var manualExposure = false
+    @Published private(set) var manualFocus = false
+    @Published private(set) var manualWB = false
+    @Published private(set) var isoValue: Float = 100
+    @Published private(set) var isoMin: Float = 25
+    @Published private(set) var isoMax: Float = 1600
+    @Published private(set) var shutterValue: Double = 60
+    @Published private(set) var shutterMin: Double = 30
+    @Published private(set) var shutterMax: Double = 8000
+    @Published private(set) var kelvin: Float = 5000
+    @Published private(set) var tint: Float = 0
+    @Published private(set) var lensPosition: Float = 0.5
+    @Published private(set) var manualStatus = "เลือก AUTO หรือ MANUAL ของแต่ละรายการ"
+    private var manualObservations: [NSKeyValueObservation] = []
     @Published private(set) var rawAvailable = false
 
     @Published private(set) var zoomFactor: CGFloat = 1.0
@@ -346,6 +382,7 @@ final class CameraController: NSObject, ObservableObject {
         case .cinematic: return cinematicAvailable
         case .video: return true
         case .pro: return proAvailable
+        case .proRes: return proResAvailable
         case .raw: return rawAvailable
         }
     }
@@ -382,6 +419,7 @@ final class CameraController: NSObject, ObservableObject {
         guard isConfigured, !isRecording, !isStartingRecording, !isReconfiguring,
               !isFinishingSegment, !isSaving else { return }
         let target: AVCaptureDevice.Position = cameraPosition == .front ? .back : .front
+        let nextMode: CameraCaptureMode = captureMode == .pro ? .pro : .video
         isReconfiguring = true
         stopSpeech()
         sessionQueue.async { [weak self] in
@@ -414,12 +452,167 @@ final class CameraController: NSObject, ObservableObject {
             }
             Task { @MainActor in
                 self.cameraPosition = target
-                self.captureMode = .video
+                self.captureMode = nextMode
                 self.zoomFactor = 1
                 self.focusExposureLocked = false
                 self.sessionQueue.async { self.applyCaptureSettings() }
             }
         }
+    }
+
+    private func withManualDevice(_ action: @escaping (AVCaptureDevice) -> Void) {
+        guard captureMode == .pro, isConfigured, !isReconfiguring, !isSaving, !isFinishingSegment else { return }
+        sessionQueue.async { [weak self] in
+            guard let self, self.captureMode == .pro, let device = self.currentDevice else { return }
+            do {
+                try device.lockForConfiguration()
+                action(device)
+                device.unlockForConfiguration()
+            } catch {
+                Task { @MainActor in self.manualStatus = "ปรับค่าไม่สำเร็จ: " + error.localizedDescription }
+            }
+        }
+    }
+
+    func setManualExposureEnabled(_ enabled: Bool) {
+        guard manualExposureSupported else { return }
+        withManualDevice { device in
+            if enabled {
+                let seconds = ManualCameraMath.exposureSeconds(denominator: 1 / max(0.000001, CMTimeGetSeconds(device.exposureDuration)),
+                    minimum: CMTimeGetSeconds(device.activeFormat.minExposureDuration),
+                    maximum: CMTimeGetSeconds(device.activeFormat.maxExposureDuration),
+                    frameSeconds: CMTimeGetSeconds(device.activeVideoMinFrameDuration))
+                device.setExposureModeCustom(duration: CMTime(seconds: seconds, preferredTimescale: 1_000_000_000), iso: device.iso, completionHandler: nil)
+            } else if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+            }
+        }
+    }
+
+    func setManualISO(_ value: Float) {
+        guard manualExposure else { return }
+        withManualDevice { device in
+            guard device.isExposureModeSupported(.custom) else { return }
+            let iso = min(max(value, device.activeFormat.minISO), device.activeFormat.maxISO)
+            device.setExposureModeCustom(duration: AVCaptureDevice.currentExposureDuration, iso: iso, completionHandler: nil)
+        }
+    }
+
+    func setManualShutter(_ denominator: Double) {
+        guard manualExposure else { return }
+        withManualDevice { device in
+            guard device.isExposureModeSupported(.custom) else { return }
+            let seconds = ManualCameraMath.exposureSeconds(denominator: denominator,
+                minimum: CMTimeGetSeconds(device.activeFormat.minExposureDuration),
+                maximum: CMTimeGetSeconds(device.activeFormat.maxExposureDuration),
+                frameSeconds: CMTimeGetSeconds(device.activeVideoMinFrameDuration))
+            device.setExposureModeCustom(duration: CMTime(seconds: seconds, preferredTimescale: 1_000_000_000),
+                                         iso: AVCaptureDevice.currentISO, completionHandler: nil)
+        }
+    }
+
+    func setManualWBEnabled(_ enabled: Bool) {
+        guard manualWBSupported else { return }
+        withManualDevice { device in
+            if enabled {
+                let gains = Self.safeGains(device.deviceWhiteBalanceGains, maximum: device.maxWhiteBalanceGain)
+                device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+            } else if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                device.whiteBalanceMode = .continuousAutoWhiteBalance
+            }
+        }
+    }
+
+    private static func safeGains(_ gains: AVCaptureDevice.WhiteBalanceGains, maximum: Float) -> AVCaptureDevice.WhiteBalanceGains {
+        AVCaptureDevice.WhiteBalanceGains(
+            redGain: ManualCameraMath.gain(gains.redGain, maximum: maximum),
+            greenGain: ManualCameraMath.gain(gains.greenGain, maximum: maximum),
+            blueGain: ManualCameraMath.gain(gains.blueGain, maximum: maximum))
+    }
+
+    func setManualWhiteBalance(temperature: Float? = nil, tint: Float? = nil) {
+        guard manualWB else { return }
+        withManualDevice { device in
+            guard device.isLockingWhiteBalanceWithCustomDeviceGainsSupported else { return }
+            let current = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains)
+            let values = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
+                temperature: min(max(temperature ?? current.temperature, 2500), 9000),
+                tint: min(max(tint ?? current.tint, -100), 100))
+            let gains = Self.safeGains(device.deviceWhiteBalanceGains(for: values), maximum: device.maxWhiteBalanceGain)
+            device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+        }
+    }
+
+    func setManualFocusEnabled(_ enabled: Bool) {
+        guard manualFocusSupported else { return }
+        withManualDevice { device in
+            if enabled { device.setFocusModeLocked(lensPosition: AVCaptureDevice.currentLensPosition, completionHandler: nil) }
+            else if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
+        }
+    }
+
+    func setManualLens(_ position: Float) {
+        guard manualFocus else { return }
+        withManualDevice { device in
+            guard device.isLockingFocusWithCustomLensPositionSupported else { return }
+            device.setFocusModeLocked(lensPosition: min(max(position, 0), 1), completionHandler: nil)
+        }
+    }
+
+    func resetProAuto() {
+        withManualDevice { device in
+            if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+            if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
+            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
+            device.setExposureTargetBias(0, completionHandler: nil)
+        }
+    }
+
+    private func observeManualValues(_ device: AVCaptureDevice) {
+        manualObservations.removeAll()
+        let update: (AVCaptureDevice) -> Void = { [weak self] device in
+            // KVO can fire while lockForConfiguration is held. Read/publish later on the session queue.
+            self?.sessionQueue.async { [weak self, weak device] in
+                guard let self, let device, self.currentDevice === device else { return }
+                let wb = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains)
+                let seconds = CMTimeGetSeconds(device.exposureDuration)
+                let lower = max(0.000001, CMTimeGetSeconds(device.activeFormat.minExposureDuration))
+                let upper = max(lower, min(CMTimeGetSeconds(device.activeFormat.maxExposureDuration), CMTimeGetSeconds(device.activeVideoMinFrameDuration)))
+                let iso = device.iso
+                let lens = device.lensPosition
+                let exposureManual = device.exposureMode == .custom
+                let focusManual = device.focusMode == .locked
+                let wbManual = device.whiteBalanceMode == .locked
+                Task { @MainActor in
+                    guard self.currentDevice === device else { return }
+                    self.isoValue = iso
+                    self.isoMin = device.activeFormat.minISO
+                    self.isoMax = max(self.isoMin + 1, device.activeFormat.maxISO)
+                    self.shutterValue = 1 / max(lower, seconds)
+                    self.shutterMin = 1 / upper
+                    self.shutterMax = max(self.shutterMin + 1, 1 / lower)
+                    self.kelvin = wb.temperature.isFinite ? min(max(wb.temperature, 2500), 9000) : 5000
+                    self.tint = wb.tint.isFinite ? min(max(wb.tint, -100), 100) : 0
+                    self.lensPosition = lens
+                    self.manualExposure = exposureManual
+                    self.manualFocus = focusManual
+                    self.manualWB = wbManual
+                    self.manualExposureSupported = device.isExposureModeSupported(.custom)
+                    self.manualFocusSupported = device.isLockingFocusWithCustomLensPositionSupported
+                    self.manualWBSupported = device.isLockingWhiteBalanceWithCustomDeviceGainsSupported
+                }
+            }
+        }
+        manualObservations = [
+            device.observe(\.iso, options: [.new]) { d, _ in update(d) },
+            device.observe(\.exposureDuration, options: [.new]) { d, _ in update(d) },
+            device.observe(\.exposureMode, options: [.new]) { d, _ in update(d) },
+            device.observe(\.lensPosition, options: [.new]) { d, _ in update(d) },
+            device.observe(\.focusMode, options: [.new]) { d, _ in update(d) },
+            device.observe(\.deviceWhiteBalanceGains, options: [.new]) { d, _ in update(d) },
+            device.observe(\.whiteBalanceMode, options: [.new]) { d, _ in update(d) }
+        ]
+        update(device)
     }
 
     func setZoom(_ value: CGFloat) {
@@ -440,6 +633,10 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func setExposureBias(_ value: Float) {
+        guard !(captureMode == .pro && manualExposure) else {
+            manualStatus = "แสงเป็น MANUAL — ปรับ ISO หรือ Shutter ในแถบ PRO"
+            return
+        }
         let target = min(max(value, minExposureBias), maxExposureBias)
         exposureBias = target
         sessionQueue.async { [weak self] in
@@ -480,6 +677,7 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func toggleFocusExposureLock() {
+        if captureMode == .pro { manualStatus = "ใช้ปุ่ม AUTO / MANUAL ในแถบ PRO"; return }
         focusExposureLocked.toggle()
         let shouldLock = focusExposureLocked
 
@@ -519,6 +717,7 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func enableAutoFocus() {
+        if captureMode == .pro { setManualFocusEnabled(false); return }
         focusExposureLocked = false
 
         sessionQueue.async { [weak self] in
@@ -564,6 +763,11 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func focus(at devicePoint: CGPoint) {
+        if captureMode == .pro && manualFocus {
+            manualStatus = "Focus เป็น MANUAL — ปรับแถบ FOCUS หรือเปลี่ยนเป็น AUTO"
+            return
+        }
+        let preserveExposure = captureMode == .pro && manualExposure
         focusExposureLocked = false
 
         sessionQueue.async { [weak self] in
@@ -585,7 +789,7 @@ final class CameraController: NSObject, ObservableObject {
                         }
                     }
 
-                    if device.isExposurePointOfInterestSupported {
+                    if !preserveExposure && device.isExposurePointOfInterestSupported {
                         device.exposurePointOfInterest = devicePoint
                         if device.isExposureModeSupported(.continuousAutoExposure) {
                             device.exposureMode = .continuousAutoExposure
@@ -607,6 +811,11 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func lockFocus(at devicePoint: CGPoint) {
+        if captureMode == .pro {
+            setManualFocusEnabled(true)
+            manualStatus = "ล็อกตำแหน่งเลนส์ปัจจุบัน • ปรับระยะที่ FOCUS"
+            return
+        }
         focusExposureLocked = true
 
         sessionQueue.async { [weak self] in
@@ -1074,7 +1283,7 @@ final class CameraController: NSObject, ObservableObject {
         var selectedFPS = frameRate
         var configurationMessage: String?
 
-        if captureMode == .video {
+        if captureMode == .video || captureMode == .pro {
             let requestedPreset: AVCaptureSession.Preset =
                 resolution == .uhd4K ? .hd4K3840x2160 : .hd1920x1080
 
@@ -1182,8 +1391,18 @@ final class CameraController: NSObject, ObservableObject {
             }
         }
 
+        do {
+            try device.lockForConfiguration()
+            if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+            if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
+            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
+            device.unlockForConfiguration()
+        } catch {
+            configurationMessage = "คืนค่า AUTO ไม่สำเร็จ: " + error.localizedDescription
+        }
         configureVideoConnection()
         updateCapabilities()
+        observeManualValues(device)
 
         if manageSessionConfiguration {
             session.commitConfiguration()
@@ -1198,6 +1417,10 @@ final class CameraController: NSObject, ObservableObject {
             self.frameRate = selectedFPS
             self.isRunning = self.session.isRunning
             self.isReconfiguring = false
+            self.focusExposureLocked = false
+            self.manualExposure = false
+            self.manualFocus = false
+            self.manualWB = false
             self.previewRevision += 1
             if self.openPortraitControlsWhenReady {
                 self.openPortraitControlsWhenReady = false
@@ -1235,9 +1458,9 @@ final class CameraController: NSObject, ObservableObject {
         let codec: AVVideoCodecType?
 
         switch captureMode {
-        case .cinematic, .video:
+        case .cinematic, .video, .pro:
             codec = available.contains(.hevc) ? .hevc : (available.contains(.h264) ? .h264 : nil)
-        case .pro:
+        case .proRes:
             if available.contains(.proRes422HQ) {
                 codec = .proRes422HQ
             } else if available.contains(.proRes422) {
@@ -1309,7 +1532,8 @@ final class CameraController: NSObject, ObservableObject {
         Task { @MainActor in
             self.portraitSupported = portrait
             self.cinematicAvailable = cine
-            self.proAvailable = pro
+            self.proResAvailable = pro
+            self.proAvailable = device.isExposureModeSupported(.custom) || device.isLockingFocusWithCustomLensPositionSupported || device.isLockingWhiteBalanceWithCustomDeviceGainsSupported
             self.rawAvailable = raw
             self.minZoomFactor = minZoom
             self.maxZoomFactor = max(maxZoom, minZoom)
@@ -1324,7 +1548,7 @@ final class CameraController: NSObject, ObservableObject {
             if self.captureMode == .cinematic && !cine {
                 self.captureMode = .video
                 self.statusText = "เครื่องนี้ไม่รองรับ Cinematic ผ่าน API ปัจจุบัน — ใช้ VIDEO แทน"
-            } else if self.captureMode == .pro && !pro {
+            } else if self.captureMode == .proRes && !pro {
                 self.captureMode = .video
                 self.statusText = "กล้องหน้า/Format นี้ไม่รองรับ ProRes — ใช้ VIDEO แทน"
             } else if self.captureMode == .raw && !raw {
@@ -2147,6 +2371,7 @@ struct CameraStudioView: View {
     @AppStorage("TANOO.camera.countdownSeconds") private var countdownSeconds = 3
     @State private var countdownRemaining: Int?
     @State private var countdownToken = UUID()
+    @State private var proControl = "ISO"
 
     var body: some View {
         ZStack {
@@ -2184,6 +2409,9 @@ struct CameraStudioView: View {
             VStack(spacing: 8) {
                 Spacer()
 
+                if camera.captureMode == .pro && !controlsExpanded {
+                    proPanel
+                }
                 if controlsExpanded {
                     expandedControls
                 } else {
@@ -2346,6 +2574,80 @@ struct CameraStudioView: View {
         .padding(.horizontal, 8)
     }
 
+    private var proPanel: some View {
+        VStack(spacing: 5) {
+            HStack {
+                Text("PRO").font(.caption.bold()).foregroundStyle(.yellow)
+                Picker("ปรับ PRO", selection: $proControl) {
+                    Text("ISO").tag("ISO")
+                    Text("ชัตเตอร์").tag("S")
+                    Text("WB").tag("WB")
+                    Text("โฟกัส").tag("F")
+                }.pickerStyle(.segmented)
+                Button("AUTO ทั้งหมด") { camera.resetProAuto() }.font(.caption2)
+            }
+            if proControl == "ISO" || proControl == "S" {
+                HStack {
+                    Text(String(format: "ISO %.0f  ·  1/%.0f s", camera.isoValue, camera.shutterValue))
+                        .font(.caption.monospacedDigit())
+                    Spacer()
+                    Button(camera.manualExposure ? "MANUAL → AUTO" : "AUTO → MANUAL") {
+                        camera.setManualExposureEnabled(!camera.manualExposure)
+                    }.font(.caption2).disabled(!camera.manualExposureSupported)
+                }
+                if proControl == "ISO" {
+                    Slider(value: Binding(get: { Double(camera.isoValue) }, set: { camera.setManualISO(Float($0)) }),
+                           in: Double(camera.isoMin)...Double(camera.isoMax))
+                        .disabled(!camera.manualExposure || !camera.manualExposureSupported)
+                } else {
+                    Slider(value: Binding(get: { log2(min(max(camera.shutterValue, camera.shutterMin), camera.shutterMax)) },
+                                          set: { camera.setManualShutter(pow(2, $0)) }),
+                           in: log2(camera.shutterMin)...log2(camera.shutterMax))
+                        .disabled(!camera.manualExposure || !camera.manualExposureSupported)
+                    HStack {
+                        ForEach([50.0, 60, 100, 120, 250], id: \.self) { value in
+                            Button("1/" + String(Int(value))) { camera.setManualShutter(value) }
+                                .disabled(!camera.manualExposure || value < camera.shutterMin || value > camera.shutterMax)
+                        }
+                    }.font(.caption2)
+                }
+                Text(camera.manualExposureSupported ? "ISO และชัตเตอร์ล็อกคู่กัน • ชัตเตอร์จำกัดตาม FPS ปัจจุบัน" : "กล้อง/รูปแบบนี้ไม่รองรับการปรับแสงเอง")
+                    .font(.caption2)
+            } else if proControl == "WB" {
+                HStack {
+                    Text(String(format: "%.0f K · Tint %+.0f", camera.kelvin, camera.tint)).font(.caption.monospacedDigit())
+                    Spacer()
+                    Button(camera.manualWB ? "MANUAL → AUTO" : "AUTO → MANUAL") { camera.setManualWBEnabled(!camera.manualWB) }
+                        .font(.caption2).disabled(!camera.manualWBSupported)
+                }
+                Slider(value: Binding(get: { Double(camera.kelvin) }, set: { camera.setManualWhiteBalance(temperature: Float($0)) }), in: 2500...9000)
+                    .disabled(!camera.manualWB || !camera.manualWBSupported)
+                HStack {
+                    Text("Tint").font(.caption2)
+                    Slider(value: Binding(get: { Double(camera.tint) }, set: { camera.setManualWhiteBalance(tint: Float($0)) }), in: -100...100)
+                        .disabled(!camera.manualWB || !camera.manualWBSupported)
+                }
+            } else {
+                HStack {
+                    Text(String(format: "เลนส์ %.2f", camera.lensPosition)).font(.caption.monospacedDigit())
+                    Spacer()
+                    Button(camera.manualFocus ? "MANUAL → AUTO" : "AUTO → MANUAL") { camera.setManualFocusEnabled(!camera.manualFocus) }
+                        .font(.caption2).disabled(!camera.manualFocusSupported)
+                }
+                Slider(value: Binding(get: { Double(camera.lensPosition) }, set: { camera.setManualLens(Float($0)) }), in: 0...1)
+                    .disabled(!camera.manualFocus || !camera.manualFocusSupported)
+                Text(camera.manualFocusSupported ? "ใกล้ ← ตำแหน่งเลนส์ → ไกล (ไม่ใช่ระยะเป็นเมตร)" : "กล้องนี้ไม่รองรับการกำหนดตำแหน่งเลนส์")
+                    .font(.caption2)
+            }
+            Text(camera.manualStatus).font(.caption2).lineLimit(2)
+        }
+        .foregroundStyle(.white)
+        .padding(10)
+        .background(.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 14))
+        .padding(.horizontal, 8)
+        .disabled(camera.isReconfiguring || camera.isSaving || camera.isFinishingSegment || camera.isStartingRecording || countdownRemaining != nil)
+    }
+
     private var expandedControls: some View {
         ScrollView {
             VStack(spacing: 9) {
@@ -2374,7 +2676,7 @@ struct CameraStudioView: View {
                             .disabled(activeTake || !camera.supportsMode(mode) || camera.isReconfiguring)
                     }
                     Spacer()
-                    Text("v3.1").font(.caption2)
+                    Text("v3.2").font(.caption2)
                 }
                 if camera.captureMode == .cinematic {
                     slider(title: "Cinematic เบลอ", valueText: String(format: "f/%.1f", camera.simulatedAperture),
@@ -2382,7 +2684,7 @@ struct CameraStudioView: View {
                            range: Double(camera.minSimulatedAperture)...Double(camera.maxSimulatedAperture))
                         .disabled(activeTake)
                 }
-                Text("Portrait กล้องหน้าใช้ 1080p30 • เปิด/ปิดในแผงเอฟเฟ็กต์ของ iOS • CINE / PRO / RAW แสดงตามที่กล้องรองรับ")
+                Text("PRO = ปรับ ISO / ชัตเตอร์ / WB / Focus เอง • ProRes / RAW = รูปแบบไฟล์ตามที่กล้องรองรับ • เลือก PRO แล้วกดซ่อนเพื่อใช้แถบปรับบนภาพ")
                     .font(.caption2).foregroundStyle(.secondary)
 
                 Picker("Mode", selection: $teleprompter.mode) {
@@ -2603,6 +2905,16 @@ struct CameraStudioView: View {
                 .disabled(camera.completedShotCount == 0 || camera.isReconfiguring || camera.isSaving)
             }
 
+            if !activeTake {
+                HStack {
+                    Button(camera.captureMode == .pro ? "✓ PRO ปรับเอง" : "PRO ปรับเอง") {
+                        camera.selectMode(camera.captureMode == .pro ? .video : .pro)
+                        controlsExpanded = false
+                    }.disabled(!camera.proAvailable || camera.isReconfiguring)
+                    Spacer()
+                    Text("v3.2").font(.caption2)
+                }.font(.caption.bold()).foregroundStyle(.yellow).padding(.horizontal, 14)
+            }
             Text(camera.isSaving ? "กำลังบันทึก… กรุณารอ" : camera.statusText)
                 .font(.caption2)
                 .foregroundStyle(.white.opacity(0.8))
