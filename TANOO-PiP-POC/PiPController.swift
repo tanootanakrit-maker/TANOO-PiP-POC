@@ -406,6 +406,30 @@ final class PiPController: NSObject, ObservableObject {
         advanceOneSegment(source: "manual")
     }
 
+    struct RecordingCheckpoint {
+        let index: Int
+        let fraction: Double
+    }
+
+    func recordingCheckpoint() -> RecordingCheckpoint {
+        RecordingCheckpoint(index: currentIndex, fraction: progress)
+    }
+
+    func restoreRecordingCheckpoint(_ checkpoint: RecordingCheckpoint) {
+        pause()
+        currentIndex = min(max(0, checkpoint.index), max(0, segments.count - 1))
+        progress = min(max(0, checkpoint.fraction), 0.999)
+        let now = CACurrentMediaTime()
+        lastTick = now
+        let line = segments.indices.contains(currentIndex) ? segments[currentIndex] : ""
+        segmentStartTime = now - progress * currentLineDuration(for: line)
+        lastMatchedTranscript = ""
+        voiceConsumedCharacters = 0
+        lastVoiceAdvanceAt = 0
+        speechStatus = "ย้อนกลับจุดเริ่มช็อตแล้ว"
+        renderViews()
+    }
+
     func resetPosition() {
         currentIndex = 0
         progress = 0
