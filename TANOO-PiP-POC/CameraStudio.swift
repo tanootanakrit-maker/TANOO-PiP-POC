@@ -2033,7 +2033,7 @@ struct CameraPreview: UIViewRepresentable {
         @objc func didLongPress(_ gesture: UILongPressGestureRecognizer) {
             guard gesture.state == .began, let view = previewView else { return }
             let point = gesture.location(in: view)
-            view.showFocusIndicator(at: point, locked: true)
+            view.showFocusIndicator(at: point, locked: true, focusOnly: controller.captureMode == .pro)
             let devicePoint = view.previewLayer.captureDevicePointConverted(fromLayerPoint: point)
             controller.lockFocus(at: devicePoint)
         }
@@ -2100,7 +2100,7 @@ final class PreviewView: UIView {
         }
     }
 
-    func showFocusIndicator(at point: CGPoint, locked: Bool) {
+    func showFocusIndicator(at point: CGPoint, locked: Bool, focusOnly: Bool = false) {
         focusIndicator?.removeFromSuperview()
 
         let box = UIView(frame: CGRect(x: 0, y: 0, width: 68, height: 68))
@@ -2117,7 +2117,7 @@ final class PreviewView: UIView {
         box.addSubview(sun)
         if locked {
             let label = UILabel(frame: CGRect(x: -22, y: 72, width: 112, height: 22))
-            label.text = "AE/AF LOCK"
+            label.text = focusOnly ? "FOCUS LOCK" : "AE/AF LOCK"
             label.textAlignment = .center
             label.textColor = .systemYellow
             label.font = .systemFont(ofSize: 11, weight: .semibold)
