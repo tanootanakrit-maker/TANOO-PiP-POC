@@ -261,6 +261,19 @@ struct TeleprompterSetupView: View {
                     step: 1
                 )
 
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("จำนวนบรรทัด Teleprompter")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Picker("จำนวนบรรทัด Teleprompter", selection: $teleprompter.visibleLineCount) {
+                        ForEach(1...6, id: \.self) { count in
+                            Text("\(count)").tag(count)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+
                 sliderRow(
                     title: "Auto Speed",
                     valueText: String(format: "%.1fx", teleprompter.autoSpeed),

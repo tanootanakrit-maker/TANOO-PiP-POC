@@ -33,9 +33,9 @@ enum VoiceFocusLevel: String, Codable, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .low: return "ต่ำ"
-        case .normal: return "ปกติ"
-        case .high: return "สูง"
+        case .low: return "อ่อน"
+        case .normal: return "กลาง"
+        case .high: return "ละเอียด"
         }
     }
 
@@ -142,6 +142,7 @@ struct SavedProject: Codable, Identifiable {
     var textColorStyle: PromptTextColor
     var voiceSensitivity: Double?
     var voiceFocusLevel: VoiceFocusLevel?
+    var visibleLineCount: Int?
     var updatedAt: Date
 }
 
@@ -155,6 +156,7 @@ struct TeleprompterSnapshot {
     var backgroundOpacity: Double
     var alignment: PromptAlignment
     var textColor: PromptTextColor
+    var visibleLineCount: Int
     var isRunning: Bool
 }
 
@@ -179,6 +181,7 @@ final class PiPController: NSObject, ObservableObject {
     @Published var backgroundOpacity: Double = 0.78
     @Published var textAlignment: PromptAlignment = .center
     @Published var textColorStyle: PromptTextColor = .cream
+    @Published var visibleLineCount: Int = 3
 
     @Published private(set) var currentIndex = 0
     @Published private(set) var isRunning = false
@@ -243,6 +246,7 @@ final class PiPController: NSObject, ObservableObject {
             backgroundOpacity: backgroundOpacity,
             alignment: textAlignment,
             textColor: textColorStyle,
+            visibleLineCount: visibleLineCount,
             isRunning: isRunning
         )
     }
@@ -476,6 +480,7 @@ final class PiPController: NSObject, ObservableObject {
             textColorStyle: textColorStyle,
             voiceSensitivity: voiceSensitivity,
             voiceFocusLevel: voiceFocusLevel,
+            visibleLineCount: visibleLineCount,
             updatedAt: Date()
         )
 
@@ -495,6 +500,7 @@ final class PiPController: NSObject, ObservableObject {
                 textColorStyle: project.textColorStyle,
                 voiceSensitivity: project.voiceSensitivity,
                 voiceFocusLevel: project.voiceFocusLevel,
+                visibleLineCount: project.visibleLineCount,
                 updatedAt: project.updatedAt
             )
             savedProjects[index] = updated
@@ -520,6 +526,7 @@ final class PiPController: NSObject, ObservableObject {
         textColorStyle = project.textColorStyle
         voiceSensitivity = project.voiceSensitivity ?? 0.40
         voiceFocusLevel = project.voiceFocusLevel ?? .normal
+        visibleLineCount = min(max(project.visibleLineCount ?? 3, 1), 6)
         rebuildSegments(reset: true)
         modeDidChange()
         statusText = "โหลดโปรเจกต์ “\(project.name)” แล้ว"
@@ -547,6 +554,7 @@ final class PiPController: NSObject, ObservableObject {
         static let backgroundOpacity = "TANOO.current.backgroundOpacity"
         static let alignment = "TANOO.current.alignment"
         static let textColor = "TANOO.current.textColor"
+        static let visibleLineCount = "TANOO.current.visibleLineCount"
     }
 
     private func loadCurrentSettings() {
@@ -591,6 +599,9 @@ final class PiPController: NSObject, ObservableObject {
         if let raw = defaults.string(forKey: CurrentSettingKey.textColor),
            let value = PromptTextColor(rawValue: raw) {
             textColorStyle = value
+        }
+        if defaults.object(forKey: CurrentSettingKey.visibleLineCount) != nil {
+            visibleLineCount = min(max(defaults.integer(forKey: CurrentSettingKey.visibleLineCount), 1), 6)
         }
     }
 
@@ -684,6 +695,15 @@ final class PiPController: NSObject, ObservableObject {
             .dropFirst()
             .sink { [weak self] value in
                 defaults.set(value.rawValue, forKey: CurrentSettingKey.textColor)
+                self?.renderViews()
+            }
+            .store(in: &settingsCancellables)
+
+        $visibleLineCount
+            .dropFirst()
+            .sink { [weak self] value in
+                let clamped = min(max(value, 1), 6)
+                defaults.set(clamped, forKey: CurrentSettingKey.visibleLineCount)
                 self?.renderViews()
             }
             .store(in: &settingsCancellables)
@@ -1542,7 +1562,8 @@ final class TeleprompterVideoView: UIView {
         let current = max(0, min(snapshot.currentIndex, snapshot.segments.count - 1))
 
         if !snapshot.segments.isEmpty {
-            for offset in 0..<4 {
+            let visibleCount = min(max(snapshot.visibleLineCount, 1), 6)
+            for offset in 0..<visibleCount {
                 let index = current + offset
                 guard index < snapshot.segments.count else { break }
 

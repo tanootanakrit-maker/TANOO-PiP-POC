@@ -3,6 +3,8 @@ import AVFoundation
 import Photos
 import Speech
 import CoreMedia
+import CoreMotion
+import MediaPlayer
 
 enum CameraCaptureMode: String, CaseIterable, Identifiable {
     case cinematic
@@ -43,7 +45,9 @@ private enum RecordingStopAction {
 final class CameraController: NSObject, ObservableObject {
     let session = AVCaptureSession()
 
-    @Published var captureMode: CameraCaptureMode = .video
+    @Published var captureMode: CameraCaptureMode = .video {
+        didSet { UserDefaults.standard.set(captureMode.rawValue, forKey: "TANOO.camera.captureMode") }
+    }
     @Published var resolution: CameraResolution = .hd1080 {
         didSet { UserDefaults.standard.set(resolution.rawValue, forKey: "TANOO.camera.resolution") }
     }
@@ -58,6 +62,7 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var isPaused = false
     @Published private(set) var isStartingRecording = false
+    @Published private(set) var isFinalizingTake = false
     @Published private(set) var isReconfiguring = false
     @Published private(set) var statusText = "กำลังเตรียมกล้อง…"
     @Published private(set) var recordingSeconds: TimeInterval = 0
@@ -67,6 +72,9 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var cinematicAvailable = false
     @Published private(set) var proAvailable = false
     @Published private(set) var rawAvailable = false
+    @Published private(set) var apertureAvailable = false
+    @Published private(set) var actualRecordingFormat = "HEVC/H.264"
+    @Published private(set) var completedTakeCount = 0
 
     @Published private(set) var zoomFactor: CGFloat = 1.0
     @Published private(set) var minZoomFactor: CGFloat = 1.0
@@ -77,11 +85,14 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var maxExposureBias: Float = 2
     @Published private(set) var focusExposureLocked = false
 
-    @Published var simulatedAperture: Float = 2.8
+    @Published var simulatedAperture: Float = 2.8 {
+        didSet { UserDefaults.standard.set(simulatedAperture, forKey: "TANOO.camera.simulatedAperture") }
+    }
     @Published private(set) var minSimulatedAperture: Float = 1.4
     @Published private(set) var maxSimulatedAperture: Float = 16
 
     var onTranscript: ((String) -> Void)?
+    var onRepeatTakeReady: (() -> Void)?
 
     private let sessionQueue = DispatchQueue(label: "com.tanoo.camera.session")
     private let audioQueue = DispatchQueue(label: "com.tanoo.camera.audio")
@@ -95,9 +106,15 @@ final class CameraController: NSObject, ObservableObject {
     private var recordingSegments: [URL] = []
     private var stopAction: RecordingStopAction = .finish
     private var resetDurationOnNextSegment = false
+    private var pendingRepeatTake = false
     private let speechBridge = CameraSpeechBridge()
 
     override init() {
+        if let raw = UserDefaults.standard.string(forKey: "TANOO.camera.captureMode"),
+           let savedMode = CameraCaptureMode(rawValue: raw) {
+            captureMode = savedMode
+        }
+
         if let raw = UserDefaults.standard.string(forKey: "TANOO.camera.resolution"),
            let savedResolution = CameraResolution(rawValue: raw) {
             resolution = savedResolution
@@ -106,6 +123,10 @@ final class CameraController: NSObject, ObservableObject {
         if UserDefaults.standard.object(forKey: "TANOO.camera.frameRate") != nil {
             let savedFPS = UserDefaults.standard.double(forKey: "TANOO.camera.frameRate")
             frameRate = savedFPS > 0 ? savedFPS : 30
+        }
+
+        if UserDefaults.standard.object(forKey: "TANOO.camera.simulatedAperture") != nil {
+            simulatedAperture = UserDefaults.standard.float(forKey: "TANOO.camera.simulatedAperture")
         }
 
         super.init()
@@ -361,8 +382,10 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func setAperture(_ value: Float) {
-        simulatedAperture = value
-        guard captureMode == .cinematic, !isRecording else { return }
+        guard captureMode == .cinematic,
+              apertureAvailable,
+              !isRecording,
+              !isStartingRecording else { return }
         sessionQueue.async { [weak self] in
             guard let self, let input = self.videoInput else { return }
             if #available(iOS 26.0, *) {
@@ -373,6 +396,7 @@ final class CameraController: NSObject, ObservableObject {
                 input.simulatedAperture = target
                 Task { @MainActor in
                     self.simulatedAperture = target
+                    self.statusText = String(format: "Cinematic • F %.1f (จำลอง)", target)
                 }
             }
         }
@@ -582,7 +606,7 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     func startNewTake() {
-        guard !isRecording, !isStartingRecording, !isReconfiguring else {
+        guard !isRecording, !isPaused, !isStartingRecording, !isFinalizingTake, !isReconfiguring else {
             let message = isReconfiguring
                 ? "REC ยังไม่เริ่ม: กล้องกำลังเปลี่ยนคุณภาพ"
                 : "REC ยังไม่เริ่ม: กล้องยังไม่พร้อม"
@@ -611,6 +635,7 @@ final class CameraController: NSObject, ObservableObject {
         }
 
         recordPreflightMessage = ""
+        pendingRepeatTake = false
         recordingSegments.removeAll()
         currentRecordingURL = nil
         recordingSeconds = 0
@@ -689,6 +714,13 @@ final class CameraController: NSObject, ObservableObject {
             isPaused = false
             finalizeRecordingSegments()
         }
+    }
+
+    func finishPausedTakeAndPrepareNewTake() {
+        guard isPaused, !isFinalizingTake else { return }
+        pendingRepeatTake = true
+        statusText = "กำลังบันทึกเทคเดิม ก่อนเริ่มเทคใหม่…"
+        finishRecording()
     }
 
     func startSpeech() {
@@ -1101,10 +1133,31 @@ final class CameraController: NSObject, ObservableObject {
         if let codec {
             movieOutput.setOutputSettings([AVVideoCodecKey: codec.rawValue], for: connection)
         }
+
+        let formatName: String
+        if #available(iOS 26.0, *), codec == .proResRAWHQ {
+            formatName = "ProRes RAW HQ"
+        } else if #available(iOS 26.0, *), codec == .proResRAW {
+            formatName = "ProRes RAW"
+        } else if codec == .proRes422HQ {
+            formatName = "ProRes 422 HQ"
+        } else if codec == .proRes422 {
+            formatName = "ProRes 422"
+        } else if codec == .hevc {
+            formatName = "HEVC"
+        } else if codec == .h264 {
+            formatName = "H.264"
+        } else {
+            formatName = "ค่าเริ่มต้นของกล้อง"
+        }
+
+        Task { @MainActor in
+            self.actualRecordingFormat = formatName
+        }
     }
 
     private func updateCapabilities() {
-        guard let device = currentDevice else { return }
+        guard let device = currentDevice, let input = videoInput else { return }
 
         let availableCodecs = movieOutput.availableVideoCodecTypes
 
@@ -1125,6 +1178,7 @@ final class CameraController: NSObject, ObservableObject {
         var minA: Float = 1.4
         var maxA: Float = 16
         var aperture = simulatedAperture
+        var supportsAperture = false
 
         if captureMode == .cinematic {
             if #available(iOS 26.0, *) {
@@ -1136,6 +1190,7 @@ final class CameraController: NSObject, ObservableObject {
                         minA = format.minSimulatedAperture
                         maxA = format.maxSimulatedAperture
                         aperture = min(max(simulatedAperture, minA), maxA)
+                        supportsAperture = input.isCinematicVideoCaptureSupported
                     }
                 }
             }
@@ -1145,6 +1200,7 @@ final class CameraController: NSObject, ObservableObject {
             self.cinematicAvailable = cine
             self.proAvailable = pro
             self.rawAvailable = raw
+            self.apertureAvailable = supportsAperture
             self.minZoomFactor = minZoom
             self.maxZoomFactor = max(maxZoom, minZoom)
             self.zoomFactor = min(max(self.zoomFactor, minZoom), max(maxZoom, minZoom))
@@ -1239,9 +1295,12 @@ final class CameraController: NSObject, ObservableObject {
     private func finalizeRecordingSegments() {
         guard !recordingSegments.isEmpty else {
             statusText = "ไม่มีคลิปสำหรับบันทึก"
+            isFinalizingTake = false
+            pendingRepeatTake = false
             return
         }
 
+        isFinalizingTake = true
         recordingTimer?.invalidate()
         recordingTimer = nil
 
@@ -1269,6 +1328,8 @@ final class CameraController: NSObject, ObservableObject {
             ) else {
                 Task { @MainActor in
                     self.statusText = "รวมคลิปไม่สำเร็จ: สร้าง Video Track ไม่ได้"
+                    self.isFinalizingTake = false
+                    self.pendingRepeatTake = false
                 }
                 return
             }
@@ -1337,12 +1398,16 @@ final class CameraController: NSObject, ObservableObject {
                         let message = exporter.error?.localizedDescription ?? "Unknown export error"
                         Task { @MainActor in
                             self.statusText = "รวมคลิปไม่สำเร็จ: " + message
+                            self.isFinalizingTake = false
+                            self.pendingRepeatTake = false
                         }
                     }
                 }
             } catch {
                 Task { @MainActor in
                     self.statusText = "รวมคลิปไม่สำเร็จ: " + error.localizedDescription
+                    self.isFinalizingTake = false
+                    self.pendingRepeatTake = false
                 }
             }
         }
@@ -1355,6 +1420,8 @@ final class CameraController: NSObject, ObservableObject {
                 self?.refreshDiskSpace()
                 Task { @MainActor in
                     self?.statusText = "วิดีโอถ่ายสำเร็จ แต่ไม่ได้รับสิทธิ์บันทึกลง Photos"
+                    self?.isFinalizingTake = false
+                    self?.pendingRepeatTake = false
                 }
                 return
             }
@@ -1365,8 +1432,16 @@ final class CameraController: NSObject, ObservableObject {
                 Task { @MainActor in
                     if success {
                         self?.statusText = "บันทึกวิดีโอลง Photos แล้ว"
+                        self?.completedTakeCount += 1
+                        self?.isFinalizingTake = false
+                        if self?.pendingRepeatTake == true {
+                            self?.pendingRepeatTake = false
+                            self?.onRepeatTakeReady?()
+                        }
                     } else {
                         self?.statusText = "บันทึก Photos ไม่สำเร็จ: " + (error?.localizedDescription ?? "Unknown error")
+                        self?.isFinalizingTake = false
+                        self?.pendingRepeatTake = false
                     }
                 }
                 try? FileManager.default.removeItem(at: url)
@@ -1595,6 +1670,195 @@ final class CameraSpeechBridge {
     }
 }
 
+final class HorizonMonitor: ObservableObject {
+    @Published private(set) var rollDegrees: Double = 0
+
+    private let motionManager = CMMotionManager()
+    private let motionQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "com.tanoo.camera.horizon"
+        queue.qualityOfService = .userInteractive
+        return queue
+    }()
+
+    func start() {
+        guard motionManager.isDeviceMotionAvailable,
+              !motionManager.isDeviceMotionActive else { return }
+
+        motionManager.deviceMotionUpdateInterval = 1.0 / 30.0
+        motionManager.startDeviceMotionUpdates(to: motionQueue) { [weak self] motion, _ in
+            guard let gravity = motion?.gravity else { return }
+            let degrees = atan2(gravity.x, -gravity.y) * 180 / .pi
+            Task { @MainActor in
+                self?.rollDegrees = degrees
+            }
+        }
+    }
+
+    func stop() {
+        motionManager.stopDeviceMotionUpdates()
+    }
+}
+
+private struct CameraGridOverlay: View {
+    var body: some View {
+        GeometryReader { geo in
+            Path { path in
+                for fraction in [1.0 / 3.0, 2.0 / 3.0] {
+                    let x = geo.size.width * fraction
+                    path.move(to: CGPoint(x: x, y: 0))
+                    path.addLine(to: CGPoint(x: x, y: geo.size.height))
+
+                    let y = geo.size.height * fraction
+                    path.move(to: CGPoint(x: 0, y: y))
+                    path.addLine(to: CGPoint(x: geo.size.width, y: y))
+                }
+            }
+            .stroke(.white.opacity(0.48), lineWidth: 0.8)
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+private struct HorizonOverlay: View {
+    let rollDegrees: Double
+
+    var body: some View {
+        let level = abs(rollDegrees) <= 1.0
+
+        VStack(spacing: 5) {
+            HStack(spacing: 7) {
+                Rectangle().frame(width: 54, height: 2)
+                Circle().frame(width: 7, height: 7)
+                Rectangle().frame(width: 54, height: 2)
+            }
+            .foregroundStyle(level ? Color.green : Color.yellow)
+            .rotationEffect(.degrees(-rollDegrees))
+
+            Text(level ? "ตรง 0°" : String(format: "%+.1f°", rollDegrees))
+                .font(.caption2.monospacedDigit().bold())
+                .foregroundStyle(level ? .green : .yellow)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(.black.opacity(0.48), in: Capsule())
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
+private final class VolumeShutterCaptureView: UIView {
+    var onVolumeUp: (() -> Void)?
+
+    private let volumeView = MPVolumeView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
+    private let audioSession = AVAudioSession.sharedInstance()
+    private var observation: NSKeyValueObservation?
+    private weak var volumeSlider: UISlider?
+    private var originalVolume: Float?
+    private var lastVolume: Float = 0.5
+    private var suppressChanges = false
+    private var active = false
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        alpha = 0.001
+        isUserInteractionEnabled = false
+        addSubview(volumeView)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func setCaptureEnabled(_ enabled: Bool) {
+        guard enabled != active else { return }
+        enabled ? activate() : deactivate()
+    }
+
+    private func activate() {
+        active = true
+        originalVolume = audioSession.outputVolume
+        volumeSlider = volumeView.subviews.compactMap { $0 as? UISlider }.first
+
+        observation = audioSession.observe(\.outputVolume, options: [.new]) { [weak self] _, change in
+            guard let self, self.active, let newValue = change.newValue else { return }
+            DispatchQueue.main.async {
+                self.handleVolumeChange(newValue)
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.moveToNeutralVolume()
+        }
+    }
+
+    private func deactivate() {
+        active = false
+        observation?.invalidate()
+        observation = nil
+        if let originalVolume {
+            setSystemVolume(originalVolume)
+        }
+        originalVolume = nil
+    }
+
+    private func handleVolumeChange(_ newValue: Float) {
+        guard !suppressChanges else {
+            lastVolume = newValue
+            return
+        }
+
+        let volumeWentUp = newValue > lastVolume + 0.001
+        lastVolume = newValue
+        if volumeWentUp {
+            onVolumeUp?()
+        }
+
+        moveToNeutralVolume()
+    }
+
+    private func moveToNeutralVolume() {
+        setSystemVolume(0.5)
+        lastVolume = 0.5
+    }
+
+    private func setSystemVolume(_ value: Float) {
+        guard let volumeSlider else { return }
+        suppressChanges = true
+        volumeSlider.value = value
+        volumeSlider.sendActions(for: .valueChanged)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+            self?.suppressChanges = false
+            self?.lastVolume = value
+        }
+    }
+
+    deinit {
+        observation?.invalidate()
+    }
+}
+
+private struct VolumeShutterCapture: UIViewRepresentable {
+    let enabled: Bool
+    let onVolumeUp: () -> Void
+
+    func makeUIView(context: Context) -> VolumeShutterCaptureView {
+        let view = VolumeShutterCaptureView(frame: .zero)
+        view.onVolumeUp = onVolumeUp
+        view.setCaptureEnabled(enabled)
+        return view
+    }
+
+    func updateUIView(_ uiView: VolumeShutterCaptureView, context: Context) {
+        uiView.onVolumeUp = onVolumeUp
+        uiView.setCaptureEnabled(enabled)
+    }
+
+    static func dismantleUIView(_ uiView: VolumeShutterCaptureView, coordinator: ()) {
+        uiView.setCaptureEnabled(false)
+    }
+}
+
 struct CameraPreview: UIViewRepresentable {
     @ObservedObject var controller: CameraController
 
@@ -1766,7 +2030,10 @@ private struct CameraPromptContent: View {
     var body: some View {
         let scale = max(0.70, min(1.18, size.width / 360.0))
         let fontSize = max(12, snapshot.fontSize * scale)
-        let rowHeight = max(42, min(size.height / 3.15, fontSize * 1.55 + snapshot.lineSpacing))
+        let visibleCount = min(max(snapshot.visibleLineCount, 1), 6)
+        let previousLineCount = visibleCount > 1 ? 1 : 0
+        let offsets = Array((-previousLineCount)..<(visibleCount - previousLineCount))
+        let rowHeight = max(34, min(size.height / CGFloat(visibleCount + 1), fontSize * 1.55 + snapshot.lineSpacing))
         let eyeY = size.height * 0.43
         let current = max(0, min(snapshot.currentIndex, max(snapshot.segments.count - 1, 0)))
 
@@ -1790,7 +2057,7 @@ private struct CameraPromptContent: View {
             .position(x: size.width / 2, y: eyeY)
 
             VStack(spacing: 0) {
-                ForEach(-1...2, id: \.self) { offset in
+                ForEach(offsets, id: \.self) { offset in
                     let index = current + offset
                     let isEyeLine = offset == 0
 
@@ -1823,7 +2090,7 @@ private struct CameraPromptContent: View {
             }
             .offset(
                 y: eyeY
-                    - rowHeight * 1.5
+                    - rowHeight * (CGFloat(previousLineCount) + 0.5)
                     - CGFloat(snapshot.progress) * rowHeight
             )
         }
@@ -1956,10 +2223,15 @@ struct CameraStudioView: View {
     var onOpenScript: (() -> Void)? = nil
 
     @State private var cameraStarted = false
+    @StateObject private var horizonMonitor = HorizonMonitor()
     @AppStorage("TANOO.camera.controlsExpanded") private var controlsExpanded = true
     @AppStorage("TANOO.camera.countdownSeconds") private var countdownSeconds = 3
+    @AppStorage("TANOO.camera.showGrid") private var showGrid = false
+    @AppStorage("TANOO.camera.showLevel") private var showLevel = false
+    @AppStorage("TANOO.camera.bluetoothShutterEnabled") private var bluetoothShutterEnabled = true
     @State private var countdownRemaining: Int?
     @State private var countdownToken = UUID()
+    @State private var remoteSinglePressTask: Task<Void, Never>?
 
     var body: some View {
         ZStack {
@@ -1970,6 +2242,15 @@ struct CameraStudioView: View {
                     .ignoresSafeArea()
             } else {
                 launchCameraView
+            }
+
+            if cameraStarted && showGrid {
+                CameraGridOverlay()
+                    .ignoresSafeArea()
+            }
+
+            if cameraStarted && showLevel {
+                HorizonOverlay(rollDegrees: horizonMonitor.rollDegrees)
             }
 
             if cameraStarted {
@@ -2006,6 +2287,13 @@ struct CameraStudioView: View {
         .statusBarHidden(true)
         .toolbar(.hidden, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
+        .background {
+            VolumeShutterCapture(
+                enabled: cameraStarted && bluetoothShutterEnabled,
+                onVolumeUp: handleRemoteVolumeUp
+            )
+            .frame(width: 1, height: 1)
+        }
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
             teleprompter.setUsesExternalSpeech(true)
@@ -2014,6 +2302,13 @@ struct CameraStudioView: View {
                     teleprompter.receiveExternalTranscript(transcript)
                 }
             }
+            camera.onRepeatTakeReady = {
+                Task { @MainActor in
+                    teleprompter.resetPosition()
+                    camera.startNewTake()
+                }
+            }
+            if showLevel { horizonMonitor.start() }
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
@@ -2021,6 +2316,10 @@ struct CameraStudioView: View {
             countdownRemaining = nil
             camera.stopSpeech()
             camera.stop()
+            camera.onRepeatTakeReady = nil
+            horizonMonitor.stop()
+            remoteSinglePressTask?.cancel()
+            remoteSinglePressTask = nil
             teleprompter.setUsesExternalSpeech(false)
             cameraStarted = false
         }
@@ -2053,6 +2352,13 @@ struct CameraStudioView: View {
         }
         .onChange(of: camera.frameRate) { _ in
             if cameraStarted { camera.reconfigure() }
+        }
+        .onChange(of: showLevel) { enabled in
+            if enabled {
+                horizonMonitor.start()
+            } else {
+                horizonMonitor.stop()
+            }
         }
     }
 
@@ -2105,6 +2411,8 @@ struct CameraStudioView: View {
             Text(camera.resolution.rawValue)
             Text("·")
             Text(String(Int(camera.frameRate)) + " FPS")
+            Text("·")
+            Text(camera.actualRecordingFormat)
             Text("·")
             Text(String(format: "%.1f GB", camera.availableDiskGB))
         }
@@ -2178,6 +2486,17 @@ struct CameraStudioView: View {
                 }
                 .pickerStyle(.segmented)
 
+                HStack(spacing: 8) {
+                    Text("บรรทัด")
+                        .font(.caption2)
+                    Picker("จำนวนบรรทัด", selection: $teleprompter.visibleLineCount) {
+                        ForEach(1...6, id: \.self) { count in
+                            Text("\(count)").tag(count)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+
                 if teleprompter.mode != .auto {
                     HStack(spacing: 8) {
                         Text("Focus Voice")
@@ -2190,6 +2509,35 @@ struct CameraStudioView: View {
                         }
                         .pickerStyle(.segmented)
                     }
+                }
+
+                HStack(spacing: 10) {
+                    Menu {
+                        ForEach(CameraCaptureMode.allCases.filter { mode in
+                            mode != .raw || camera.rawAvailable
+                        }) { mode in
+                            Button {
+                                camera.selectMode(mode)
+                            } label: {
+                                if camera.captureMode == mode {
+                                    Label(mode.title, systemImage: "checkmark")
+                                } else {
+                                    Text(mode.title)
+                                }
+                            }
+                            .disabled(!camera.supportsMode(mode))
+                        }
+                    } label: {
+                        Label(camera.captureMode.title, systemImage: "camera.filters")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(activeTake || camera.isReconfiguring)
+
+                    Text(camera.actualRecordingFormat)
+                        .font(.caption2.bold())
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity)
                 }
 
                 HStack(spacing: 8) {
@@ -2316,6 +2664,41 @@ struct CameraStudioView: View {
                 }
                 .disabled(!cameraStarted)
 
+                if camera.captureMode == .cinematic && camera.apertureAvailable {
+                    slider(
+                        title: "F (จำลอง)",
+                        valueText: String(format: "f/%.1f", camera.simulatedAperture),
+                        value: Binding(
+                            get: { Double(camera.simulatedAperture) },
+                            set: { camera.setAperture(Float($0)) }
+                        ),
+                        range: Double(camera.minSimulatedAperture)...Double(max(
+                            camera.maxSimulatedAperture,
+                            camera.minSimulatedAperture + 0.1
+                        ))
+                    )
+                    .disabled(activeTake)
+                } else {
+                    Text("F ของเลนส์ iPhone ปรับจริงไม่ได้ • ค่า F จำลองเปิดเฉพาะ Cinematic ที่เครื่องและ API รองรับ")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                HStack(spacing: 14) {
+                    Toggle("Grid", isOn: $showGrid)
+                    Toggle("Level", isOn: $showLevel)
+                    Toggle("รีโมท", isOn: $bluetoothShutterEnabled)
+                }
+                .font(.caption2)
+
+                if bluetoothShutterEnabled {
+                    Text("ปุ่มเพิ่มเสียง/รีโมท: กด 1 ครั้ง = REC/Pause/Resume • ขณะ Pause กด 2 ครั้งติดกัน = บันทึกเทคเดิมและเริ่ม New Take")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
                 HStack(spacing: 8) {
                     Button {
                         camera.enableAutoFocus()
@@ -2372,6 +2755,10 @@ struct CameraStudioView: View {
                 Text("กำลังเตรียม REC…")
                     .font(.caption.bold())
                     .foregroundStyle(.orange)
+            } else if camera.isFinalizingTake {
+                Text("กำลังบันทึกเทคเดิมลง Photos…")
+                    .font(.caption.bold())
+                    .foregroundStyle(.orange)
             }
 
             ZStack {
@@ -2388,15 +2775,27 @@ struct CameraStudioView: View {
                             }
                             .accessibilityLabel("Pause Recording")
                         } else if camera.isPaused {
-                            Button {
-                                resumeVideo()
-                            } label: {
-                                Image(systemName: "play.fill")
-                                    .font(.title3.bold())
-                                    .frame(width: 52, height: 52)
-                                    .background(.white.opacity(0.17), in: Circle())
+                            HStack(spacing: 8) {
+                                Button {
+                                    resumeVideo()
+                                } label: {
+                                    Image(systemName: "play.fill")
+                                        .font(.headline.bold())
+                                        .frame(width: 48, height: 48)
+                                        .background(.white.opacity(0.17), in: Circle())
+                                }
+                                .accessibilityLabel("Resume Recording")
+
+                                Button {
+                                    requestRepeatTake()
+                                } label: {
+                                    Image(systemName: "repeat")
+                                        .font(.headline.bold())
+                                        .frame(width: 48, height: 48)
+                                        .background(.orange.opacity(0.78), in: Circle())
+                                }
+                                .accessibilityLabel("บันทึกเทคเดิมและเริ่ม New Take")
                             }
-                            .accessibilityLabel("Resume Recording")
                         } else {
                             Color.clear.frame(width: 52, height: 52)
                         }
@@ -2455,7 +2854,7 @@ struct CameraStudioView: View {
     }
 
     private var activeTake: Bool {
-        camera.isRecording || camera.isPaused || camera.isStartingRecording
+        camera.isRecording || camera.isPaused || camera.isStartingRecording || camera.isFinalizingTake
     }
 
     private var shutterEnabled: Bool {
@@ -2466,7 +2865,8 @@ struct CameraStudioView: View {
         return cameraStarted &&
             camera.isConfigured &&
             !camera.isReconfiguring &&
-            !camera.isStartingRecording
+            !camera.isStartingRecording &&
+            !camera.isFinalizingTake
     }
 
     private func shutterPressed() {
@@ -2518,7 +2918,46 @@ struct CameraStudioView: View {
     }
 
     private func resumeVideo() {
+        remoteSinglePressTask?.cancel()
+        remoteSinglePressTask = nil
         camera.resumeRecording()
+    }
+
+    private func requestRepeatTake() {
+        remoteSinglePressTask?.cancel()
+        remoteSinglePressTask = nil
+        guard camera.isPaused else { return }
+        camera.finishPausedTakeAndPrepareNewTake()
+    }
+
+    private func handleRemoteVolumeUp() {
+        guard bluetoothShutterEnabled, cameraStarted else { return }
+
+        if camera.isRecording {
+            pauseVideo()
+            return
+        }
+
+        if camera.isPaused {
+            if remoteSinglePressTask != nil {
+                requestRepeatTake()
+                return
+            }
+
+            remoteSinglePressTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 650_000_000)
+                guard !Task.isCancelled else { return }
+                remoteSinglePressTask = nil
+                if camera.isPaused {
+                    resumeVideo()
+                }
+            }
+            return
+        }
+
+        if !camera.isStartingRecording && !camera.isFinalizingTake {
+            shutterPressed()
+        }
     }
 
     private func cancelCountdown() {
