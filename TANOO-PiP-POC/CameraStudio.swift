@@ -92,7 +92,6 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var maxSimulatedAperture: Float = 16
 
     var onTranscript: ((String) -> Void)?
-    var onRepeatTakeReady: (() -> Void)?
 
     private let sessionQueue = DispatchQueue(label: "com.tanoo.camera.session")
     private let audioQueue = DispatchQueue(label: "com.tanoo.camera.audio")
@@ -106,7 +105,6 @@ final class CameraController: NSObject, ObservableObject {
     private var recordingSegments: [URL] = []
     private var stopAction: RecordingStopAction = .finish
     private var resetDurationOnNextSegment = false
-    private var pendingRepeatTake = false
     private let speechBridge = CameraSpeechBridge()
 
     override init() {
@@ -635,7 +633,6 @@ final class CameraController: NSObject, ObservableObject {
         }
 
         recordPreflightMessage = ""
-        pendingRepeatTake = false
         recordingSegments.removeAll()
         currentRecordingURL = nil
         recordingSeconds = 0
@@ -714,13 +711,6 @@ final class CameraController: NSObject, ObservableObject {
             isPaused = false
             finalizeRecordingSegments()
         }
-    }
-
-    func finishPausedTakeAndPrepareNewTake() {
-        guard isPaused, !isFinalizingTake else { return }
-        pendingRepeatTake = true
-        statusText = "กำลังเก็บเทคก่อนหน้า ก่อนอัดซ้ำจากจุดเริ่มเดิม…"
-        finishRecording()
     }
 
     func startSpeech() {
@@ -1296,7 +1286,6 @@ final class CameraController: NSObject, ObservableObject {
         guard !recordingSegments.isEmpty else {
             statusText = "ไม่มีคลิปสำหรับบันทึก"
             isFinalizingTake = false
-            pendingRepeatTake = false
             return
         }
 
@@ -1329,7 +1318,6 @@ final class CameraController: NSObject, ObservableObject {
                 Task { @MainActor in
                     self.statusText = "รวมคลิปไม่สำเร็จ: สร้าง Video Track ไม่ได้"
                     self.isFinalizingTake = false
-                    self.pendingRepeatTake = false
                 }
                 return
             }
@@ -1399,7 +1387,6 @@ final class CameraController: NSObject, ObservableObject {
                         Task { @MainActor in
                             self.statusText = "รวมคลิปไม่สำเร็จ: " + message
                             self.isFinalizingTake = false
-                            self.pendingRepeatTake = false
                         }
                     }
                 }
@@ -1407,7 +1394,6 @@ final class CameraController: NSObject, ObservableObject {
                 Task { @MainActor in
                     self.statusText = "รวมคลิปไม่สำเร็จ: " + error.localizedDescription
                     self.isFinalizingTake = false
-                    self.pendingRepeatTake = false
                 }
             }
         }
@@ -1421,7 +1407,6 @@ final class CameraController: NSObject, ObservableObject {
                 Task { @MainActor in
                     self?.statusText = "วิดีโอถ่ายสำเร็จ แต่ไม่ได้รับสิทธิ์บันทึกลง Photos"
                     self?.isFinalizingTake = false
-                    self?.pendingRepeatTake = false
                 }
                 return
             }
@@ -1434,14 +1419,9 @@ final class CameraController: NSObject, ObservableObject {
                         self?.statusText = "บันทึกวิดีโอลง Photos แล้ว"
                         self?.completedTakeCount += 1
                         self?.isFinalizingTake = false
-                        if self?.pendingRepeatTake == true {
-                            self?.pendingRepeatTake = false
-                            self?.onRepeatTakeReady?()
-                        }
                     } else {
                         self?.statusText = "บันทึก Photos ไม่สำเร็จ: " + (error?.localizedDescription ?? "Unknown error")
                         self?.isFinalizingTake = false
-                        self?.pendingRepeatTake = false
                     }
                 }
                 try? FileManager.default.removeItem(at: url)
@@ -2232,7 +2212,7 @@ struct CameraStudioView: View {
     @State private var countdownRemaining: Int?
     @State private var countdownToken = UUID()
     @State private var remoteSinglePressTask: Task<Void, Never>?
-    @State private var takeStartPosition: TeleprompterPosition?
+    @State private var segmentStartPosition: TeleprompterPosition?
 
     var body: some View {
         ZStack {
@@ -2303,14 +2283,6 @@ struct CameraStudioView: View {
                     teleprompter.receiveExternalTranscript(transcript)
                 }
             }
-            camera.onRepeatTakeReady = {
-                Task { @MainActor in
-                    if let takeStartPosition {
-                        teleprompter.restorePosition(takeStartPosition)
-                    }
-                    camera.startNewTake()
-                }
-            }
             if showLevel { horizonMonitor.start() }
         }
         .onDisappear {
@@ -2319,7 +2291,6 @@ struct CameraStudioView: View {
             countdownRemaining = nil
             camera.stopSpeech()
             camera.stop()
-            camera.onRepeatTakeReady = nil
             horizonMonitor.stop()
             remoteSinglePressTask?.cancel()
             remoteSinglePressTask = nil
@@ -2696,7 +2667,7 @@ struct CameraStudioView: View {
                 .font(.caption2)
 
                 if bluetoothShutterEnabled {
-                    Text("ปุ่มเพิ่มเสียง/รีโมท: กด 1 ครั้ง = REC/Pause/Resume • ขณะ Pause กด 2 ครั้งติดกัน = เก็บเทคก่อนหน้าและอัดซ้ำจากจุดเริ่มเดิม")
+                    Text("ปุ่มเพิ่มเสียง/รีโมท: กด 1 ครั้ง = REC/Pause/Resume • ขณะ Pause กด 2 ครั้งติดกัน = เพิ่มช่วงอัดซ้ำจากจุดเริ่มของเทคล่าสุดในวิดีโอเดียวกัน")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2759,7 +2730,7 @@ struct CameraStudioView: View {
                     .font(.caption.bold())
                     .foregroundStyle(.orange)
             } else if camera.isFinalizingTake {
-                Text("กำลังบันทึกเทคเดิมลง Photos…")
+                Text("กำลังรวมทุกเทคเป็นวิดีโอเดียว…")
                     .font(.caption.bold())
                     .foregroundStyle(.orange)
             }
@@ -2797,7 +2768,7 @@ struct CameraStudioView: View {
                                         .frame(width: 48, height: 48)
                                         .background(.orange.opacity(0.78), in: Circle())
                                 }
-                                .accessibilityLabel("บันทึกเทคเดิมและอัดซ้ำจากจุดเริ่มเดิม")
+                                .accessibilityLabel("เพิ่มช่วงอัดซ้ำจากจุดเริ่มของเทคล่าสุด")
                             }
                         } else {
                             Color.clear.frame(width: 52, height: 52)
@@ -2876,7 +2847,7 @@ struct CameraStudioView: View {
         if camera.isRecording || camera.isPaused {
             countdownToken = UUID()
             countdownRemaining = nil
-            takeStartPosition = nil
+            segmentStartPosition = nil
             camera.finishRecording()
             camera.stopSpeech()
 
@@ -2924,6 +2895,7 @@ struct CameraStudioView: View {
     private func resumeVideo() {
         remoteSinglePressTask?.cancel()
         remoteSinglePressTask = nil
+        segmentStartPosition = teleprompter.capturePosition()
         camera.resumeRecording()
     }
 
@@ -2931,7 +2903,10 @@ struct CameraStudioView: View {
         remoteSinglePressTask?.cancel()
         remoteSinglePressTask = nil
         guard camera.isPaused else { return }
-        camera.finishPausedTakeAndPrepareNewTake()
+        if let segmentStartPosition {
+            teleprompter.restorePosition(segmentStartPosition)
+        }
+        camera.resumeRecording()
     }
 
     private func handleRemoteVolumeUp() {
@@ -2972,7 +2947,7 @@ struct CameraStudioView: View {
     private func beginRecording() {
         guard shutterEnabled else { return }
 
-        takeStartPosition = teleprompter.capturePosition()
+        segmentStartPosition = teleprompter.capturePosition()
         if teleprompter.isRunning {
             teleprompter.pause()
         }
