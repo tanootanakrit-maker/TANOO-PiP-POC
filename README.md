@@ -19,8 +19,8 @@ Native iPhone teleprompter that uses Apple's Live Picture in Picture so the prom
 - Black overlay opacity
 - 1–6 prompt segments visible in PiP (default 3)
 - Local project persistence
-- Pause → Resume → Stop และ New Take โดยเก็บเทคเดิมลง Photos ก่อน
-- Bluetooth selfie shutter / ปุ่มเพิ่มเสียง: REC, Pause, Resume และกดสองครั้งขณะ Pause เพื่อ New Take
+- Pause → Resume → Stop และ Repeat Take โดยเก็บเทคเดิมลง Photos ก่อน แล้วอัดซ้ำจากตำแหน่ง Teleprompter ที่เทคนั้นเริ่ม
+- Bluetooth selfie shutter / ปุ่มเพิ่มเสียง: REC, Pause, Resume และกดสองครั้งขณะ Pause เพื่อเก็บเทคเดิมแล้วอัดซ้ำจากจุดเริ่มเดิม
 - Grid และ Level/Horizon overlay ที่เปิดปิดและจำค่าได้
 - เลือกจำนวนบรรทัด Teleprompter 1–6 บรรทัด (ค่าเริ่มต้น 3)
 - ตรวจ codec จากกล้องจริงก่อนแสดง ProRes RAW; ไม่ใช้ชื่อ RAW กับไฟล์ HEVC/H.264

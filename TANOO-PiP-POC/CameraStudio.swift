@@ -719,7 +719,7 @@ final class CameraController: NSObject, ObservableObject {
     func finishPausedTakeAndPrepareNewTake() {
         guard isPaused, !isFinalizingTake else { return }
         pendingRepeatTake = true
-        statusText = "กำลังบันทึกเทคเดิม ก่อนเริ่มเทคใหม่…"
+        statusText = "กำลังเก็บเทคก่อนหน้า ก่อนอัดซ้ำจากจุดเริ่มเดิม…"
         finishRecording()
     }
 
@@ -2232,6 +2232,7 @@ struct CameraStudioView: View {
     @State private var countdownRemaining: Int?
     @State private var countdownToken = UUID()
     @State private var remoteSinglePressTask: Task<Void, Never>?
+    @State private var takeStartPosition: TeleprompterPosition?
 
     var body: some View {
         ZStack {
@@ -2304,7 +2305,9 @@ struct CameraStudioView: View {
             }
             camera.onRepeatTakeReady = {
                 Task { @MainActor in
-                    teleprompter.resetPosition()
+                    if let takeStartPosition {
+                        teleprompter.restorePosition(takeStartPosition)
+                    }
                     camera.startNewTake()
                 }
             }
@@ -2693,7 +2696,7 @@ struct CameraStudioView: View {
                 .font(.caption2)
 
                 if bluetoothShutterEnabled {
-                    Text("ปุ่มเพิ่มเสียง/รีโมท: กด 1 ครั้ง = REC/Pause/Resume • ขณะ Pause กด 2 ครั้งติดกัน = บันทึกเทคเดิมและเริ่ม New Take")
+                    Text("ปุ่มเพิ่มเสียง/รีโมท: กด 1 ครั้ง = REC/Pause/Resume • ขณะ Pause กด 2 ครั้งติดกัน = เก็บเทคก่อนหน้าและอัดซ้ำจากจุดเริ่มเดิม")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2794,7 +2797,7 @@ struct CameraStudioView: View {
                                         .frame(width: 48, height: 48)
                                         .background(.orange.opacity(0.78), in: Circle())
                                 }
-                                .accessibilityLabel("บันทึกเทคเดิมและเริ่ม New Take")
+                                .accessibilityLabel("บันทึกเทคเดิมและอัดซ้ำจากจุดเริ่มเดิม")
                             }
                         } else {
                             Color.clear.frame(width: 52, height: 52)
@@ -2873,6 +2876,7 @@ struct CameraStudioView: View {
         if camera.isRecording || camera.isPaused {
             countdownToken = UUID()
             countdownRemaining = nil
+            takeStartPosition = nil
             camera.finishRecording()
             camera.stopSpeech()
 
@@ -2968,10 +2972,10 @@ struct CameraStudioView: View {
     private func beginRecording() {
         guard shutterEnabled else { return }
 
+        takeStartPosition = teleprompter.capturePosition()
         if teleprompter.isRunning {
             teleprompter.pause()
         }
-        teleprompter.resetPosition()
 
         camera.startNewTake()
 

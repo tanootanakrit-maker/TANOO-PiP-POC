@@ -160,6 +160,11 @@ struct TeleprompterSnapshot {
     var isRunning: Bool
 }
 
+struct TeleprompterPosition: Equatable {
+    fileprivate let index: Int
+    fileprivate let progress: Double
+}
+
 @MainActor
 final class PiPController: NSObject, ObservableObject {
     @Published var projectName = "TANOO Script"
@@ -414,6 +419,25 @@ final class PiPController: NSObject, ObservableObject {
         currentIndex = 0
         progress = 0
         segmentStartTime = CACurrentMediaTime()
+        lastMatchedTranscript = ""
+        voiceConsumedCharacters = 0
+        lastVoiceAdvanceAt = 0
+        renderViews()
+    }
+
+    func capturePosition() -> TeleprompterPosition {
+        TeleprompterPosition(index: currentIndex, progress: progress)
+    }
+
+    func restorePosition(_ position: TeleprompterPosition) {
+        let lastIndex = max(segments.count - 1, 0)
+        currentIndex = min(max(position.index, 0), lastIndex)
+        progress = min(max(position.progress, 0), 0.999)
+
+        let now = CACurrentMediaTime()
+        lastTick = now
+        let current = segments.indices.contains(currentIndex) ? segments[currentIndex] : ""
+        segmentStartTime = now - progress * currentLineDuration(for: current)
         lastMatchedTranscript = ""
         voiceConsumedCharacters = 0
         lastVoiceAdvanceAt = 0
