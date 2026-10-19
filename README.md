@@ -21,7 +21,8 @@ Native iPhone teleprompter that uses Apple's Live Picture in Picture so the prom
 - Local project persistence
 - Pause → Resume → Stop และ Repeat Take โดยอัดทุกช่วงต่อในงานเดียว และรวมเป็นวิดีโอเดียวเมื่อกด Stop
 - Repeat Take ย้อน Teleprompter ไปจุดเริ่มของเทคล่าสุด แล้วเพิ่มช่วงอัดซ้ำต่อท้ายโดยไม่ลบช่วงเดิม
-- Bluetooth selfie shutter / ปุ่มเพิ่มเสียง: REC, Pause, Resume และกดสองครั้งขณะ Pause เพื่อ Repeat Take
+- Resume และ Repeat Take ใช้ Countdown เดียวกับการเริ่มอัดใหม่
+- Bluetooth selfie shutter / ปุ่มเพิ่มเสียงตอบสนองทันทีโดยไม่รอแยก single/double press: หลัง Pause กดหนึ่งครั้งเพื่อเริ่ม Countdown ของ Resume และกดซ้ำระหว่าง Countdown เพื่อเปลี่ยนเป็น Repeat Take
 - Grid และ Level/Horizon overlay ที่เปิดปิดและจำค่าได้
 - เลือกจำนวนบรรทัด Teleprompter 1–6 บรรทัด (ค่าเริ่มต้น 3)
 - ตรวจ codec จากกล้องจริงก่อนแสดง ProRes RAW; ไม่ใช้ชื่อ RAW กับไฟล์ HEVC/H.264

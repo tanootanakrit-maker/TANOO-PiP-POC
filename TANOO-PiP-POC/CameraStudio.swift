@@ -2197,6 +2197,23 @@ private struct MovableResizableTeleprompter: View {
     }
 }
 
+private enum RecordingCountdownAction: Equatable {
+    case newRecording
+    case resume
+    case repeatLatest
+
+    var label: String {
+        switch self {
+        case .newRecording:
+            return "เริ่มบันทึก"
+        case .resume:
+            return "บันทึกต่อ"
+        case .repeatLatest:
+            return "อัดซ้ำเทคล่าสุด"
+        }
+    }
+}
+
 struct CameraStudioView: View {
     @ObservedObject var camera: CameraController
     @ObservedObject var teleprompter: PiPController
@@ -2211,7 +2228,8 @@ struct CameraStudioView: View {
     @AppStorage("TANOO.camera.bluetoothShutterEnabled") private var bluetoothShutterEnabled = true
     @State private var countdownRemaining: Int?
     @State private var countdownToken = UUID()
-    @State private var remoteSinglePressTask: Task<Void, Never>?
+    @State private var countdownAction: RecordingCountdownAction?
+    @State private var countdownOriginalPosition: TeleprompterPosition?
     @State private var segmentStartPosition: TeleprompterPosition?
 
     var body: some View {
@@ -2243,10 +2261,17 @@ struct CameraStudioView: View {
                     Color.black.opacity(0.30)
                         .ignoresSafeArea()
 
-                    Text(String(countdownRemaining))
-                        .font(.system(size: 110, weight: .bold, design: .rounded))
-                        .foregroundStyle(.white)
-                        .shadow(radius: 10)
+                    VStack(spacing: 4) {
+                        Text(String(countdownRemaining))
+                            .font(.system(size: 110, weight: .bold, design: .rounded))
+
+                        if let countdownAction {
+                            Text(countdownAction.label)
+                                .font(.headline.bold())
+                        }
+                    }
+                    .foregroundStyle(.white)
+                    .shadow(radius: 10)
                 }
                 .allowsHitTesting(false)
             }
@@ -2292,8 +2317,8 @@ struct CameraStudioView: View {
             camera.stopSpeech()
             camera.stop()
             horizonMonitor.stop()
-            remoteSinglePressTask?.cancel()
-            remoteSinglePressTask = nil
+            countdownAction = nil
+            countdownOriginalPosition = nil
             teleprompter.setUsesExternalSpeech(false)
             cameraStarted = false
         }
@@ -2667,7 +2692,7 @@ struct CameraStudioView: View {
                 .font(.caption2)
 
                 if bluetoothShutterEnabled {
-                    Text("ปุ่มเพิ่มเสียง/รีโมท: กด 1 ครั้ง = REC/Pause/Resume • ขณะ Pause กด 2 ครั้งติดกัน = เพิ่มช่วงอัดซ้ำจากจุดเริ่มของเทคล่าสุดในวิดีโอเดียวกัน")
+                    Text("ปุ่มเพิ่มเสียง/รีโมทตอบสนองทันที: REC/Pause • หลัง Pause กด 1 ครั้ง = เริ่มนับถอยหลังเพื่อ Resume • กดซ้ำระหว่างนับ = เปลี่ยนเป็น Repeat เทคล่าสุด")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2847,6 +2872,8 @@ struct CameraStudioView: View {
         if camera.isRecording || camera.isPaused {
             countdownToken = UUID()
             countdownRemaining = nil
+            countdownAction = nil
+            countdownOriginalPosition = nil
             segmentStartPosition = nil
             camera.finishRecording()
             camera.stopSpeech()
@@ -2862,25 +2889,7 @@ struct CameraStudioView: View {
             return
         }
 
-        if countdownSeconds <= 0 {
-            beginRecording()
-            return
-        }
-
-        let token = UUID()
-        countdownToken = token
-
-        Task { @MainActor in
-            for value in stride(from: countdownSeconds, through: 1, by: -1) {
-                guard countdownToken == token else { return }
-                countdownRemaining = value
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-            }
-
-            guard countdownToken == token else { return }
-            countdownRemaining = nil
-            beginRecording()
-        }
+        startCountdown(for: .newRecording)
     }
 
     private func pauseVideo() {
@@ -2893,24 +2902,26 @@ struct CameraStudioView: View {
     }
 
     private func resumeVideo() {
-        remoteSinglePressTask?.cancel()
-        remoteSinglePressTask = nil
-        segmentStartPosition = teleprompter.capturePosition()
-        camera.resumeRecording()
+        guard camera.isPaused else { return }
+        startCountdown(for: .resume)
     }
 
     private func requestRepeatTake() {
-        remoteSinglePressTask?.cancel()
-        remoteSinglePressTask = nil
         guard camera.isPaused else { return }
-        if let segmentStartPosition {
-            teleprompter.restorePosition(segmentStartPosition)
-        }
-        camera.resumeRecording()
+        startCountdown(for: .repeatLatest)
     }
 
     private func handleRemoteVolumeUp() {
         guard bluetoothShutterEnabled, cameraStarted else { return }
+
+        if countdownRemaining != nil {
+            if camera.isPaused && countdownAction == .resume {
+                requestRepeatTake()
+            } else {
+                cancelCountdown()
+            }
+            return
+        }
 
         if camera.isRecording {
             pauseVideo()
@@ -2918,19 +2929,7 @@ struct CameraStudioView: View {
         }
 
         if camera.isPaused {
-            if remoteSinglePressTask != nil {
-                requestRepeatTake()
-                return
-            }
-
-            remoteSinglePressTask = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 650_000_000)
-                guard !Task.isCancelled else { return }
-                remoteSinglePressTask = nil
-                if camera.isPaused {
-                    resumeVideo()
-                }
-            }
+            resumeVideo()
             return
         }
 
@@ -2942,6 +2941,77 @@ struct CameraStudioView: View {
     private func cancelCountdown() {
         countdownToken = UUID()
         countdownRemaining = nil
+        if countdownAction == .repeatLatest, let countdownOriginalPosition {
+            teleprompter.restorePosition(countdownOriginalPosition)
+        }
+        countdownAction = nil
+        countdownOriginalPosition = nil
+    }
+
+    private func startCountdown(for action: RecordingCountdownAction) {
+        guard !camera.isStartingRecording, !camera.isFinalizingTake else { return }
+
+        if action == .newRecording {
+            guard !camera.isRecording, !camera.isPaused, shutterEnabled else { return }
+        } else {
+            guard camera.isPaused else { return }
+        }
+
+        countdownToken = UUID()
+        countdownRemaining = nil
+
+        if countdownAction == .repeatLatest,
+           action != .repeatLatest,
+           let countdownOriginalPosition {
+            teleprompter.restorePosition(countdownOriginalPosition)
+            self.countdownOriginalPosition = nil
+        }
+
+        if action == .repeatLatest, countdownAction != .repeatLatest {
+            countdownOriginalPosition = teleprompter.capturePosition()
+            if let segmentStartPosition {
+                teleprompter.restorePosition(segmentStartPosition)
+            }
+        }
+
+        countdownAction = action
+
+        guard countdownSeconds > 0 else {
+            countdownAction = nil
+            countdownOriginalPosition = nil
+            performCountdownAction(action)
+            return
+        }
+
+        let token = UUID()
+        countdownToken = token
+        countdownRemaining = countdownSeconds
+
+        Task { @MainActor in
+            for value in stride(from: countdownSeconds, through: 1, by: -1) {
+                guard countdownToken == token else { return }
+                countdownRemaining = value
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+
+            guard countdownToken == token else { return }
+            countdownRemaining = nil
+            countdownAction = nil
+            countdownOriginalPosition = nil
+            performCountdownAction(action)
+        }
+    }
+
+    private func performCountdownAction(_ action: RecordingCountdownAction) {
+        switch action {
+        case .newRecording:
+            beginRecording()
+        case .resume:
+            segmentStartPosition = teleprompter.capturePosition()
+            camera.resumeRecording()
+        case .repeatLatest:
+            camera.resumeRecording()
+        }
     }
 
     private func beginRecording() {
