@@ -73,6 +73,9 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var proAvailable = false
     @Published private(set) var rawAvailable = false
     @Published private(set) var apertureAvailable = false
+    @Published private(set) var portraitEffectSupported = false
+    @Published private(set) var portraitEffectEnabled = false
+    @Published private(set) var portraitEffectActive = false
     @Published private(set) var actualRecordingFormat = "HEVC/H.264"
     @Published private(set) var completedTakeCount = 0
 
@@ -324,6 +327,12 @@ final class CameraController: NSObject, ObservableObject {
         sessionQueue.async { [weak self] in
             guard let self else { return }
             self.applyCaptureSettings()
+        }
+    }
+
+    func refreshBlurSupport() {
+        sessionQueue.async { [weak self] in
+            self?.updateCapabilities()
         }
     }
 
@@ -972,6 +981,58 @@ final class CameraController: NSObject, ObservableObject {
                 configurationMessage = "4K ไม่รองรับกับ configuration นี้ — กลับเป็น 1080p"
             }
 
+            if #available(iOS 15.0, *), AVCaptureDevice.isPortraitEffectEnabled {
+                func portraitFormats(
+                    resolution: CameraResolution,
+                    frameRate: Double
+                ) -> [AVCaptureDevice.Format] {
+                    let dimensions = resolution.dimensions
+                    return device.formats.filter { format in
+                        let d = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+                        guard d.width == dimensions.width,
+                              d.height == dimensions.height,
+                              format.isPortraitEffectSupported,
+                              let range = format.videoFrameRateRangeForPortraitEffect else { return false }
+                        return frameRate >= range.minFrameRate && frameRate <= range.maxFrameRate
+                    }
+                }
+
+                var portraitCandidates = portraitFormats(
+                    resolution: selectedResolution,
+                    frameRate: selectedFPS
+                )
+
+                if portraitCandidates.isEmpty {
+                    selectedFPS = 30
+                    portraitCandidates = portraitFormats(
+                        resolution: selectedResolution,
+                        frameRate: selectedFPS
+                    )
+                }
+
+                if portraitCandidates.isEmpty {
+                    selectedResolution = .hd1080
+                    if session.canSetSessionPreset(.hd1920x1080) {
+                        session.sessionPreset = .hd1920x1080
+                    }
+                    portraitCandidates = portraitFormats(
+                        resolution: selectedResolution,
+                        frameRate: selectedFPS
+                    )
+                }
+
+                if let portraitFormat = portraitCandidates.first {
+                    do {
+                        try device.lockForConfiguration()
+                        device.activeFormat = portraitFormat
+                        device.unlockForConfiguration()
+                        configurationMessage = "Portrait Effect ใช้ " + selectedResolution.rawValue + " " + String(Int(selectedFPS)) + "fps"
+                    } catch {
+                        configurationMessage = "เลือก Format สำหรับฉากหลังเบลอไม่สำเร็จ: " + error.localizedDescription
+                    }
+                }
+            }
+
             do {
                 try device.lockForConfiguration()
 
@@ -1099,6 +1160,10 @@ final class CameraController: NSObject, ObservableObject {
             session.startRunning()
         }
 
+        sessionQueue.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self?.updateCapabilities()
+        }
+
         Task { @MainActor in
             self.resolution = selectedResolution
             self.frameRate = selectedFPS
@@ -1204,6 +1269,15 @@ final class CameraController: NSObject, ObservableObject {
         var maxA: Float = 16
         var aperture = simulatedAperture
         var supportsAperture = false
+        var supportsPortraitEffect = false
+        var portraitEffectIsEnabled = false
+        var portraitEffectIsActive = false
+
+        if #available(iOS 15.0, *) {
+            supportsPortraitEffect = device.formats.contains { $0.isPortraitEffectSupported }
+            portraitEffectIsEnabled = AVCaptureDevice.isPortraitEffectEnabled
+            portraitEffectIsActive = device.isPortraitEffectActive
+        }
 
         if captureMode == .cinematic {
             if #available(iOS 26.0, *) {
@@ -1226,6 +1300,9 @@ final class CameraController: NSObject, ObservableObject {
             self.proAvailable = pro
             self.rawAvailable = raw
             self.apertureAvailable = supportsAperture
+            self.portraitEffectSupported = supportsPortraitEffect
+            self.portraitEffectEnabled = portraitEffectIsEnabled
+            self.portraitEffectActive = portraitEffectIsActive
             self.minZoomFactor = minZoom
             self.maxZoomFactor = max(maxZoom, minZoom)
             self.zoomFactor = min(max(self.zoomFactor, minZoom), max(maxZoom, minZoom))
@@ -2394,6 +2471,11 @@ struct CameraStudioView: View {
                 horizonMonitor.stop()
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            if cameraStarted {
+                camera.refreshBlurSupport()
+            }
+        }
     }
 
     private var launchCameraView: some View {
@@ -2450,6 +2532,10 @@ struct CameraStudioView: View {
             if camera.captureMode == .cinematic && camera.apertureAvailable {
                 Text("·")
                 Text(String(format: "f/%.1f", camera.simulatedAperture))
+            } else if camera.portraitEffectActive {
+                Text("·")
+                Text("PORTRAIT")
+                    .foregroundStyle(.green)
             }
             Text("·")
             Text(String(format: "%.1f GB", camera.availableDiskGB))
@@ -2939,8 +3025,41 @@ struct CameraStudioView: View {
                 Text("ระบบจะเลือกความละเอียดและ 30 FPS ที่รองรับให้อัตโนมัติ")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+            } else if camera.portraitEffectSupported {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(camera.portraitEffectActive ? Color.green : Color.orange)
+                        .frame(width: 8, height: 8)
+
+                    Text(
+                        camera.portraitEffectActive
+                            ? "Portrait Effect กำลังเบลอฉากหลัง"
+                            : (camera.portraitEffectEnabled
+                                ? "Portrait Effect เปิดอยู่ แต่ยังไม่ Active"
+                                : "รองรับ Portrait Effect")
+                    )
+                    .font(.caption2.bold())
+
+                    Spacer()
+
+                    Button("ตรวจอีกครั้ง") {
+                        camera.refreshBlurSupport()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+
+                if camera.portraitEffectActive {
+                    Text("แอปกำลังใช้เอฟเฟ็กต์เบลอของ iOS กับภาพจากกล้องและวิดีโอ")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("เปิดศูนย์ควบคุมระหว่างใช้กล้อง → เอฟเฟ็กต์วิดีโอ → ภาพถ่ายบุคคล แล้วกลับเข้าแอป")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             } else {
-                Text("กล้องหรือ iOS รุ่นนี้ไม่รองรับฉากหลังเบลอผ่าน Cinematic API")
+                Text("กล้อง/Format ปัจจุบันไม่รองรับทั้ง Cinematic และ Portrait Effect")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }

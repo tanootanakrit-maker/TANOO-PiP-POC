@@ -28,6 +28,7 @@ Native iPhone teleprompter that uses Apple's Live Picture in Picture so the prom
 - ตรวจ codec จากกล้องจริงก่อนแสดง ProRes RAW; ไม่ใช้ชื่อ RAW กับไฟล์ HEVC/H.264
 - เมนูฉากหลังเบลอแสดงตลอด พร้อมปุ่มเปิด CINE และปรับความละเอียด/30 FPS ไปยังค่าที่อุปกรณ์รองรับอัตโนมัติ
 - ค่า F เป็น simulated aperture เฉพาะ Cinematic ที่ device/API รองรับ และแสดงบนแถบสถานะขณะใช้งาน
+- iOS 15–25 รองรับ System Portrait Effect จาก Control Center พร้อมตรวจสถานะ Active และเลือก Format/FPS ที่รองรับอัตโนมัติ
 
 ## Important iOS limitation
 
