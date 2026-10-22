@@ -29,6 +29,8 @@ Native iPhone teleprompter that uses Apple's Live Picture in Picture so the prom
 - เมนูฉากหลังเบลอแสดงตลอด พร้อมปุ่มเปิด CINE และปรับความละเอียด/30 FPS ไปยังค่าที่อุปกรณ์รองรับอัตโนมัติ
 - ค่า F เป็น simulated aperture เฉพาะ Cinematic ที่ device/API รองรับ และแสดงบนแถบสถานะขณะใช้งาน
 - iOS 15–25 รองรับ System Portrait Effect จาก Control Center พร้อมตรวจสถานะ Active และเลือก Format/FPS ที่รองรับอัตโนมัติ
+- TANOO Blur ทำ Person Segmentation และเบลอพื้นหลังลงในวิดีโอไฟล์สุดท้ายภายในแอป ไม่ต้องมีปุ่ม Portrait ใน Control Center
+- ปรับระดับ TANOO Blur ได้ 15–100% ใช้ VIDEO 1080p 30fps เพื่อความเสถียร และประมวลผลวิดีโอรวมทุกเทคหลัง Stop โดยยังคงเสียงไว้
 
 ## Important iOS limitation
 

@@ -4,6 +4,8 @@ import Photos
 import Speech
 import CoreMedia
 import CoreMotion
+import CoreImage
+import CoreImage.CIFilterBuiltins
 import MediaPlayer
 
 enum CameraCaptureMode: String, CaseIterable, Identifiable {
@@ -93,6 +95,22 @@ final class CameraController: NSObject, ObservableObject {
     }
     @Published private(set) var minSimulatedAperture: Float = 1.4
     @Published private(set) var maxSimulatedAperture: Float = 16
+    @Published var softwareBackgroundBlurEnabled = true {
+        didSet {
+            UserDefaults.standard.set(
+                softwareBackgroundBlurEnabled,
+                forKey: "TANOO.camera.softwareBackgroundBlurEnabled"
+            )
+        }
+    }
+    @Published var softwareBackgroundBlurAmount: Double = 0.58 {
+        didSet {
+            UserDefaults.standard.set(
+                softwareBackgroundBlurAmount,
+                forKey: "TANOO.camera.softwareBackgroundBlurAmount"
+            )
+        }
+    }
 
     var onTranscript: ((String) -> Void)?
 
@@ -128,6 +146,19 @@ final class CameraController: NSObject, ObservableObject {
 
         if UserDefaults.standard.object(forKey: "TANOO.camera.simulatedAperture") != nil {
             simulatedAperture = UserDefaults.standard.float(forKey: "TANOO.camera.simulatedAperture")
+        }
+
+        if UserDefaults.standard.object(forKey: "TANOO.camera.softwareBackgroundBlurEnabled") != nil {
+            softwareBackgroundBlurEnabled = UserDefaults.standard.bool(
+                forKey: "TANOO.camera.softwareBackgroundBlurEnabled"
+            )
+        }
+
+        if UserDefaults.standard.object(forKey: "TANOO.camera.softwareBackgroundBlurAmount") != nil {
+            softwareBackgroundBlurAmount = min(
+                max(UserDefaults.standard.double(forKey: "TANOO.camera.softwareBackgroundBlurAmount"), 0.15),
+                1.0
+            )
         }
 
         super.init()
@@ -626,7 +657,12 @@ final class CameraController: NSObject, ObservableObject {
         refreshDiskSpace()
 
         let freeGB = freeDiskSpaceGB()
-        let minimumGB = resolution == .uhd4K ? 2.0 : 1.0
+        let minimumGB: Double
+        if softwareBackgroundBlurEnabled && captureMode == .video {
+            minimumGB = 2.0
+        } else {
+            minimumGB = resolution == .uhd4K ? 2.0 : 1.0
+        }
 
         guard freeGB >= minimumGB else {
             let message = String(
@@ -967,9 +1003,15 @@ final class CameraController: NSObject, ObservableObject {
         var selectedFPS = frameRate
         var configurationMessage: String?
 
+        if softwareBackgroundBlurEnabled && captureMode == .video {
+            selectedResolution = .hd1080
+            selectedFPS = 30
+            configurationMessage = "TANOO Blur ใช้ 1080p 30fps เพื่อความเสถียร"
+        }
+
         if captureMode == .video {
             let requestedPreset: AVCaptureSession.Preset =
-                resolution == .uhd4K ? .hd4K3840x2160 : .hd1920x1080
+                selectedResolution == .uhd4K ? .hd4K3840x2160 : .hd1920x1080
 
             if session.canSetSessionPreset(requestedPreset) {
                 session.sessionPreset = requestedPreset
@@ -1407,8 +1449,13 @@ final class CameraController: NSObject, ObservableObject {
 
         if recordingSegments.count == 1, let url = recordingSegments.first {
             recordingSegments.removeAll()
-            statusText = "กำลังบันทึกลง Photos…"
-            saveVideoToPhotos(url)
+            if shouldRenderSoftwareBackgroundBlur {
+                statusText = "กำลังสร้างฉากหลังเบลอใน TANOO…"
+                renderSoftwareBackgroundBlur(sourceURL: url)
+            } else {
+                statusText = "กำลังบันทึกลง Photos…"
+                saveVideoToPhotos(url)
+            }
             return
         }
 
@@ -1491,8 +1538,13 @@ final class CameraController: NSObject, ObservableObject {
 
                         Task { @MainActor in
                             self.recordingSegments.removeAll()
-                            self.statusText = "รวมคลิปแล้ว กำลังบันทึกลง Photos…"
-                            self.saveVideoToPhotos(outputURL)
+                            if self.shouldRenderSoftwareBackgroundBlur {
+                                self.statusText = "รวมคลิปแล้ว กำลังสร้างฉากหลังเบลอใน TANOO…"
+                                self.renderSoftwareBackgroundBlur(sourceURL: outputURL)
+                            } else {
+                                self.statusText = "รวมคลิปแล้ว กำลังบันทึกลง Photos…"
+                                self.saveVideoToPhotos(outputURL)
+                            }
                         }
                     } else {
                         let message = exporter.error?.localizedDescription ?? "Unknown export error"
@@ -1506,6 +1558,115 @@ final class CameraController: NSObject, ObservableObject {
                 Task { @MainActor in
                     self.statusText = "รวมคลิปไม่สำเร็จ: " + error.localizedDescription
                     self.isFinalizingTake = false
+                }
+            }
+        }
+    }
+
+    private var shouldRenderSoftwareBackgroundBlur: Bool {
+        softwareBackgroundBlurEnabled &&
+            captureMode == .video &&
+            !portraitEffectActive
+    }
+
+    private func renderSoftwareBackgroundBlur(sourceURL: URL) {
+        guard #available(iOS 15.0, *) else {
+            statusText = "iOS รุ่นนี้ไม่รองรับ TANOO Blur — กำลังบันทึกวิดีโอต้นฉบับ"
+            saveVideoToPhotos(sourceURL)
+            return
+        }
+
+        let asset = AVAsset(url: sourceURL)
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TANOO-BLUR-" + UUID().uuidString)
+            .appendingPathExtension("mov")
+        let blurRadius = 8.0 + (min(max(softwareBackgroundBlurAmount, 0.15), 1.0) * 26.0)
+
+        let composition = AVVideoComposition(
+            asset: asset,
+            applyingCIFiltersWithHandler: { request in
+                autoreleasepool {
+                    let extent = request.sourceImage.extent
+                    let source = request.sourceImage.clampedToExtent()
+                    let segmentation = CIFilter.personSegmentation()
+                    segmentation.inputImage = source
+                    segmentation.qualityLevel = 1
+
+                    guard var mask = segmentation.outputImage,
+                          mask.extent.width > 0,
+                          mask.extent.height > 0 else {
+                        request.finish(with: request.sourceImage, context: nil)
+                        return
+                    }
+
+                    let scaleX = extent.width / mask.extent.width
+                    let scaleY = extent.height / mask.extent.height
+                    mask = mask.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+                    mask = mask
+                        .transformed(by: CGAffineTransform(
+                            translationX: extent.minX - mask.extent.minX,
+                            y: extent.minY - mask.extent.minY
+                        ))
+                        .cropped(to: extent)
+                        .applyingFilter(
+                            "CIGaussianBlur",
+                            parameters: [kCIInputRadiusKey: 1.8]
+                        )
+                        .cropped(to: extent)
+
+                    let blurredBackground = source
+                        .applyingFilter(
+                            "CIGaussianBlur",
+                            parameters: [kCIInputRadiusKey: blurRadius]
+                        )
+                        .cropped(to: extent)
+
+                    let result = source
+                        .applyingFilter(
+                            "CIBlendWithMask",
+                            parameters: [
+                                kCIInputBackgroundImageKey: blurredBackground,
+                                kCIInputMaskImageKey: mask
+                            ]
+                        )
+                        .cropped(to: extent)
+
+                    request.finish(with: result, context: nil)
+                }
+            }
+        )
+
+        let preset = AVAssetExportSession.exportPresets(compatibleWith: asset)
+            .contains(AVAssetExportPreset1920x1080)
+            ? AVAssetExportPreset1920x1080
+            : AVAssetExportPresetHighestQuality
+
+        guard let exporter = AVAssetExportSession(asset: asset, presetName: preset) else {
+            statusText = "สร้าง TANOO Blur ไม่ได้ — กำลังบันทึกวิดีโอต้นฉบับ"
+            saveVideoToPhotos(sourceURL)
+            return
+        }
+
+        exporter.outputURL = outputURL
+        exporter.outputFileType = .mov
+        exporter.videoComposition = composition
+        exporter.shouldOptimizeForNetworkUse = false
+
+        exporter.exportAsynchronously { [weak self] in
+            guard let self else { return }
+
+            if exporter.status == .completed {
+                try? FileManager.default.removeItem(at: sourceURL)
+                Task { @MainActor in
+                    self.statusText = "สร้างฉากหลังเบลอแล้ว กำลังบันทึกลง Photos…"
+                    self.saveVideoToPhotos(outputURL)
+                }
+            } else {
+                try? FileManager.default.removeItem(at: outputURL)
+                let message = exporter.error?.localizedDescription ?? "Unknown export error"
+                Task { @MainActor in
+                    self.statusText = "TANOO Blur ไม่สำเร็จ (" + message + ") — บันทึกวิดีโอต้นฉบับแทน"
+                    self.saveVideoToPhotos(sourceURL)
                 }
             }
         }
@@ -2536,6 +2697,10 @@ struct CameraStudioView: View {
                 Text("·")
                 Text("PORTRAIT")
                     .foregroundStyle(.green)
+            } else if camera.captureMode == .video && camera.softwareBackgroundBlurEnabled {
+                Text("·")
+                Text("TANOO BLUR")
+                    .foregroundStyle(.green)
             }
             Text("·")
             Text(String(format: "%.1f GB", camera.availableDiskGB))
@@ -2861,7 +3026,7 @@ struct CameraStudioView: View {
                     .font(.caption.bold())
                     .foregroundStyle(.orange)
             } else if camera.isFinalizingTake {
-                Text("กำลังรวมทุกเทคเป็นวิดีโอเดียว…")
+                Text(camera.statusText)
                     .font(.caption.bold())
                     .foregroundStyle(.orange)
             }
@@ -2975,6 +3140,10 @@ struct CameraStudioView: View {
                     Text(String(format: "f/%.1f", camera.simulatedAperture))
                         .font(.caption.monospacedDigit().bold())
                         .foregroundStyle(.yellow)
+                } else if camera.captureMode == .video && camera.softwareBackgroundBlurEnabled {
+                    Text("TANOO BLUR")
+                        .font(.caption2.bold())
+                        .foregroundStyle(.green)
                 }
             }
 
@@ -2996,72 +3165,65 @@ struct CameraStudioView: View {
                 Text("เป็นค่า F จำลองของ Cinematic ไม่ใช่รูรับแสงจริงของเลนส์")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-            } else if !cameraStarted {
-                Text("เปิดกล้องก่อนเพื่อใช้งานฉากหลังเบลอ")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            } else if camera.isReconfiguring {
-                HStack(spacing: 7) {
-                    ProgressView()
-                    Text("กำลังเปิดฉากหลังเบลอ…")
-                        .font(.caption2)
-                }
-            } else if camera.cinematicAvailable && camera.captureMode != .cinematic {
+            } else if camera.captureMode == .video {
                 HStack(spacing: 8) {
-                    Text("ใช้ได้ในโหมด CINE")
+                    Toggle(
+                        "เบลอใน TANOO",
+                        isOn: Binding(
+                            get: { camera.softwareBackgroundBlurEnabled },
+                            set: { camera.softwareBackgroundBlurEnabled = $0 }
+                        )
+                    )
+                    .font(.caption2.bold())
+                    .disabled(activeTake)
+
+                    Spacer()
+
+                    Text(camera.softwareBackgroundBlurEnabled ? "เปิด" : "ปิด")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(camera.softwareBackgroundBlurEnabled ? .green : .secondary)
+                }
+
+                if camera.softwareBackgroundBlurEnabled {
+                    slider(
+                        title: "ระดับเบลอ",
+                        valueText: String(format: "%.0f%%", camera.softwareBackgroundBlurAmount * 100),
+                        value: Binding(
+                            get: { camera.softwareBackgroundBlurAmount },
+                            set: { camera.softwareBackgroundBlurAmount = $0 }
+                        ),
+                        range: 0.15...1.0
+                    )
+                    .disabled(activeTake)
+
+                    Text("ภาพ Preview จะยังไม่เบลอ • หลังจากกด Stop TANOO จะแยกบุคคลและเบลอพื้นหลังลงในไฟล์เดียวก่อนบันทึก Photos • ใช้ 1080p 30fps เพื่อความเสถียร")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                if camera.cinematicAvailable && camera.captureMode != .cinematic {
+                    Button("ใช้ CINE แทน (เห็นเบลอขณะถ่าย)") {
+                        camera.selectMode(.cinematic)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(activeTake)
+                }
+            } else {
+                HStack(spacing: 8) {
+                    Text("TANOO Blur ใช้ได้ในโหมด VIDEO")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
 
                     Spacer()
 
-                    Button("เปิด CINE") {
-                        camera.selectMode(.cinematic)
+                    Button("ใช้ VIDEO") {
+                        camera.selectMode(.video)
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .disabled(activeTake)
                 }
-
-                Text("ระบบจะเลือกความละเอียดและ 30 FPS ที่รองรับให้อัตโนมัติ")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            } else if camera.portraitEffectSupported {
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(camera.portraitEffectActive ? Color.green : Color.orange)
-                        .frame(width: 8, height: 8)
-
-                    Text(
-                        camera.portraitEffectActive
-                            ? "Portrait Effect กำลังเบลอฉากหลัง"
-                            : (camera.portraitEffectEnabled
-                                ? "Portrait Effect เปิดอยู่ แต่ยังไม่ Active"
-                                : "รองรับ Portrait Effect")
-                    )
-                    .font(.caption2.bold())
-
-                    Spacer()
-
-                    Button("ตรวจอีกครั้ง") {
-                        camera.refreshBlurSupport()
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-
-                if camera.portraitEffectActive {
-                    Text("แอปกำลังใช้เอฟเฟ็กต์เบลอของ iOS กับภาพจากกล้องและวิดีโอ")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("เปิดศูนย์ควบคุมระหว่างใช้กล้อง → เอฟเฟ็กต์วิดีโอ → ภาพถ่ายบุคคล แล้วกลับเข้าแอป")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                Text("กล้อง/Format ปัจจุบันไม่รองรับทั้ง Cinematic และ Portrait Effect")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
             }
         }
         .padding(9)
