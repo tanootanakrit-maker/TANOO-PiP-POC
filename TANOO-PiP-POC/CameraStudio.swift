@@ -1007,22 +1007,55 @@ final class CameraController: NSObject, ObservableObject {
             }
         } else {
             // Advanced modes keep format-specific capability checks.
-            let dimensions = resolution.dimensions
-            let candidates = device.formats.filter { format in
-                let d = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-                guard d.width == dimensions.width, d.height == dimensions.height else { return false }
+            var requestedResolution = resolution
+            var requestedFrameRate = frameRate
 
-                if captureMode == .cinematic {
-                    if #available(iOS 26.0, *) {
-                        guard format.isCinematicVideoCaptureSupported,
-                              let range = format.videoFrameRateRangeForCinematicVideo else { return false }
-                        return frameRate >= range.minFrameRate && frameRate <= range.maxFrameRate
+            func matchingFormats(
+                resolution: CameraResolution,
+                frameRate: Double
+            ) -> [AVCaptureDevice.Format] {
+                let dimensions = resolution.dimensions
+                return device.formats.filter { format in
+                    let d = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+                    guard d.width == dimensions.width, d.height == dimensions.height else { return false }
+
+                    if captureMode == .cinematic {
+                        if #available(iOS 26.0, *) {
+                            guard format.isCinematicVideoCaptureSupported,
+                                  let range = format.videoFrameRateRangeForCinematicVideo else { return false }
+                            return frameRate >= range.minFrameRate && frameRate <= range.maxFrameRate
+                        }
+                        return false
                     }
-                    return false
+
+                    return format.videoSupportedFrameRateRanges.contains {
+                        frameRate >= $0.minFrameRate && frameRate <= $0.maxFrameRate
+                    }
+                }
+            }
+
+            var candidates = matchingFormats(
+                resolution: requestedResolution,
+                frameRate: requestedFrameRate
+            )
+
+            if captureMode == .cinematic, candidates.isEmpty {
+                requestedFrameRate = 30
+                candidates = matchingFormats(
+                    resolution: requestedResolution,
+                    frameRate: requestedFrameRate
+                )
+
+                if candidates.isEmpty {
+                    requestedResolution = .hd1080
+                    candidates = matchingFormats(
+                        resolution: requestedResolution,
+                        frameRate: requestedFrameRate
+                    )
                 }
 
-                return format.videoSupportedFrameRateRanges.contains {
-                    frameRate >= $0.minFrameRate && frameRate <= $0.maxFrameRate
+                if !candidates.isEmpty {
+                    configurationMessage = "Cinematic ใช้ " + requestedResolution.rawValue + " 30fps เพื่อเปิดฉากหลังเบลอ"
                 }
             }
 
@@ -1030,10 +1063,12 @@ final class CameraController: NSObject, ObservableObject {
                 do {
                     try device.lockForConfiguration()
                     device.activeFormat = selected
-                    let duration = CMTime(value: 1, timescale: CMTimeScale(max(1, Int32(frameRate))))
+                    let duration = CMTime(value: 1, timescale: CMTimeScale(max(1, Int32(requestedFrameRate))))
                     device.activeVideoMinFrameDuration = duration
                     device.activeVideoMaxFrameDuration = duration
                     device.unlockForConfiguration()
+                    selectedResolution = requestedResolution
+                    selectedFPS = requestedFrameRate
                 } catch {
                     configurationMessage = "เลือก Format ไม่สำเร็จ: " + error.localizedDescription
                 }
@@ -2412,6 +2447,10 @@ struct CameraStudioView: View {
             Text(String(Int(camera.frameRate)) + " FPS")
             Text("·")
             Text(camera.actualRecordingFormat)
+            if camera.captureMode == .cinematic && camera.apertureAvailable {
+                Text("·")
+                Text(String(format: "f/%.1f", camera.simulatedAperture))
+            }
             Text("·")
             Text(String(format: "%.1f GB", camera.availableDiskGB))
         }
@@ -2663,26 +2702,7 @@ struct CameraStudioView: View {
                 }
                 .disabled(!cameraStarted)
 
-                if camera.captureMode == .cinematic && camera.apertureAvailable {
-                    slider(
-                        title: "F (จำลอง)",
-                        valueText: String(format: "f/%.1f", camera.simulatedAperture),
-                        value: Binding(
-                            get: { Double(camera.simulatedAperture) },
-                            set: { camera.setAperture(Float($0)) }
-                        ),
-                        range: Double(camera.minSimulatedAperture)...Double(max(
-                            camera.maxSimulatedAperture,
-                            camera.minSimulatedAperture + 0.1
-                        ))
-                    )
-                    .disabled(activeTake)
-                } else {
-                    Text("F ของเลนส์ iPhone ปรับจริงไม่ได้ • ค่า F จำลองเปิดเฉพาะ Cinematic ที่เครื่องและ API รองรับ")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                backgroundBlurControl
 
                 HStack(spacing: 14) {
                     Toggle("Grid", isOn: $showGrid)
@@ -2854,6 +2874,79 @@ struct CameraStudioView: View {
 
     private var activeTake: Bool {
         camera.isRecording || camera.isPaused || camera.isStartingRecording || camera.isFinalizingTake
+    }
+
+    @ViewBuilder
+    private var backgroundBlurControl: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Label("ฉากหลังเบลอ", systemImage: "camera.aperture")
+                    .font(.caption.bold())
+
+                Spacer()
+
+                if camera.captureMode == .cinematic && camera.apertureAvailable {
+                    Text(String(format: "f/%.1f", camera.simulatedAperture))
+                        .font(.caption.monospacedDigit().bold())
+                        .foregroundStyle(.yellow)
+                }
+            }
+
+            if camera.captureMode == .cinematic && camera.apertureAvailable {
+                slider(
+                    title: "ระดับเบลอ",
+                    valueText: "F ต่ำ = เบลอมาก",
+                    value: Binding(
+                        get: { Double(camera.simulatedAperture) },
+                        set: { camera.setAperture(Float($0)) }
+                    ),
+                    range: Double(camera.minSimulatedAperture)...Double(max(
+                        camera.maxSimulatedAperture,
+                        camera.minSimulatedAperture + 0.1
+                    ))
+                )
+                .disabled(activeTake)
+
+                Text("เป็นค่า F จำลองของ Cinematic ไม่ใช่รูรับแสงจริงของเลนส์")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else if !cameraStarted {
+                Text("เปิดกล้องก่อนเพื่อใช้งานฉากหลังเบลอ")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else if camera.isReconfiguring {
+                HStack(spacing: 7) {
+                    ProgressView()
+                    Text("กำลังเปิดฉากหลังเบลอ…")
+                        .font(.caption2)
+                }
+            } else if camera.cinematicAvailable && camera.captureMode != .cinematic {
+                HStack(spacing: 8) {
+                    Text("ใช้ได้ในโหมด CINE")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    Button("เปิด CINE") {
+                        camera.selectMode(.cinematic)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(activeTake)
+                }
+
+                Text("ระบบจะเลือกความละเอียดและ 30 FPS ที่รองรับให้อัตโนมัติ")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("กล้องหรือ iOS รุ่นนี้ไม่รองรับฉากหลังเบลอผ่าน Cinematic API")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(9)
+        .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
     }
 
     private var shutterEnabled: Bool {

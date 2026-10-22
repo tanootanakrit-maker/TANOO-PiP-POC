@@ -26,7 +26,8 @@ Native iPhone teleprompter that uses Apple's Live Picture in Picture so the prom
 - Grid และ Level/Horizon overlay ที่เปิดปิดและจำค่าได้
 - เลือกจำนวนบรรทัด Teleprompter 1–6 บรรทัด (ค่าเริ่มต้น 3)
 - ตรวจ codec จากกล้องจริงก่อนแสดง ProRes RAW; ไม่ใช้ชื่อ RAW กับไฟล์ HEVC/H.264
-- ค่า F เป็น simulated aperture เฉพาะ Cinematic ที่ device/API รองรับ
+- เมนูฉากหลังเบลอแสดงตลอด พร้อมปุ่มเปิด CINE และปรับความละเอียด/30 FPS ไปยังค่าที่อุปกรณ์รองรับอัตโนมัติ
+- ค่า F เป็น simulated aperture เฉพาะ Cinematic ที่ device/API รองรับ และแสดงบนแถบสถานะขณะใช้งาน
 
 ## Important iOS limitation
 
