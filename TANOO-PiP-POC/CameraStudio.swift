@@ -39,6 +39,14 @@ enum CameraResolution: String, CaseIterable, Identifiable {
     }
 }
 
+enum CameraControlMode: String, CaseIterable, Identifiable {
+    case auto
+    case manual
+
+    var id: String { rawValue }
+    var title: String { self == .auto ? "AUTO" : "MANUAL" }
+}
+
 private enum RecordingStopAction {
     case finish
     case pause
@@ -80,6 +88,8 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var portraitEffectActive = false
     @Published private(set) var actualRecordingFormat = "HEVC/H.264"
     @Published private(set) var completedTakeCount = 0
+    @Published private(set) var currentTakeName = "TANOO Take 1"
+    @Published private(set) var lastSavedTakeName = ""
 
     @Published private(set) var zoomFactor: CGFloat = 1.0
     @Published private(set) var minZoomFactor: CGFloat = 1.0
@@ -89,6 +99,57 @@ final class CameraController: NSObject, ObservableObject {
     @Published private(set) var minExposureBias: Float = -2
     @Published private(set) var maxExposureBias: Float = 2
     @Published private(set) var focusExposureLocked = false
+
+    @Published var controlMode: CameraControlMode = .auto {
+        didSet { UserDefaults.standard.set(controlMode.rawValue, forKey: "TANOO.camera.controlMode") }
+    }
+    @Published var manualFocusEnabled = false {
+        didSet { UserDefaults.standard.set(manualFocusEnabled, forKey: "TANOO.camera.manualFocusEnabled") }
+    }
+    @Published var manualFocusPosition: Float = 0.5 {
+        didSet { UserDefaults.standard.set(manualFocusPosition, forKey: "TANOO.camera.manualFocusPosition") }
+    }
+    @Published var manualExposureEnabled = false {
+        didSet { UserDefaults.standard.set(manualExposureEnabled, forKey: "TANOO.camera.manualExposureEnabled") }
+    }
+    @Published var manualISO: Float = 100 {
+        didSet { UserDefaults.standard.set(manualISO, forKey: "TANOO.camera.manualISO") }
+    }
+    @Published var manualShutterDenominator: Double = 60 {
+        didSet {
+            UserDefaults.standard.set(
+                manualShutterDenominator,
+                forKey: "TANOO.camera.manualShutterDenominator"
+            )
+        }
+    }
+    @Published var manualWhiteBalanceEnabled = false {
+        didSet {
+            UserDefaults.standard.set(
+                manualWhiteBalanceEnabled,
+                forKey: "TANOO.camera.manualWhiteBalanceEnabled"
+            )
+        }
+    }
+    @Published var whiteBalanceTemperature: Float = 5_000 {
+        didSet {
+            UserDefaults.standard.set(
+                whiteBalanceTemperature,
+                forKey: "TANOO.camera.whiteBalanceTemperature"
+            )
+        }
+    }
+    @Published var whiteBalanceTint: Float = 0 {
+        didSet { UserDefaults.standard.set(whiteBalanceTint, forKey: "TANOO.camera.whiteBalanceTint") }
+    }
+
+    @Published private(set) var manualFocusAvailable = false
+    @Published private(set) var manualExposureAvailable = false
+    @Published private(set) var manualWhiteBalanceAvailable = false
+    @Published private(set) var minISO: Float = 25
+    @Published private(set) var maxISO: Float = 2_000
+    @Published private(set) var minShutterDenominator: Double = 1
+    @Published private(set) var maxShutterDenominator: Double = 2_000
 
     @Published var simulatedAperture: Float = 2.8 {
         didSet { UserDefaults.standard.set(simulatedAperture, forKey: "TANOO.camera.simulatedAperture") }
@@ -124,6 +185,10 @@ final class CameraController: NSObject, ObservableObject {
     private var recordingTimer: Timer?
     private var currentRecordingURL: URL?
     private var recordingSegments: [URL] = []
+    private var recordingSegmentIndex = 0
+    private var currentTakeDirectoryURL: URL?
+    private var takeCounters: [String: Int] = [:]
+    private let takeCountersKey = "TANOO.camera.takeCounters.v1"
     private var stopAction: RecordingStopAction = .finish
     private var resetDurationOnNextSegment = false
     private let speechBridge = CameraSpeechBridge()
@@ -159,6 +224,49 @@ final class CameraController: NSObject, ObservableObject {
                 max(UserDefaults.standard.double(forKey: "TANOO.camera.softwareBackgroundBlurAmount"), 0.15),
                 1.0
             )
+        }
+
+        if let raw = UserDefaults.standard.string(forKey: "TANOO.camera.controlMode"),
+           let savedMode = CameraControlMode(rawValue: raw) {
+            controlMode = savedMode
+        }
+        manualFocusEnabled = UserDefaults.standard.bool(forKey: "TANOO.camera.manualFocusEnabled")
+        manualExposureEnabled = UserDefaults.standard.bool(forKey: "TANOO.camera.manualExposureEnabled")
+        manualWhiteBalanceEnabled = UserDefaults.standard.bool(
+            forKey: "TANOO.camera.manualWhiteBalanceEnabled"
+        )
+        if UserDefaults.standard.object(forKey: "TANOO.camera.manualFocusPosition") != nil {
+            manualFocusPosition = min(
+                max(UserDefaults.standard.float(forKey: "TANOO.camera.manualFocusPosition"), 0),
+                1
+            )
+        }
+        if UserDefaults.standard.object(forKey: "TANOO.camera.manualISO") != nil {
+            manualISO = UserDefaults.standard.float(forKey: "TANOO.camera.manualISO")
+        }
+        if UserDefaults.standard.object(forKey: "TANOO.camera.manualShutterDenominator") != nil {
+            manualShutterDenominator = max(
+                UserDefaults.standard.double(forKey: "TANOO.camera.manualShutterDenominator"),
+                1
+            )
+        }
+        if UserDefaults.standard.object(forKey: "TANOO.camera.whiteBalanceTemperature") != nil {
+            whiteBalanceTemperature = UserDefaults.standard.float(
+                forKey: "TANOO.camera.whiteBalanceTemperature"
+            )
+        }
+        if UserDefaults.standard.object(forKey: "TANOO.camera.whiteBalanceTint") != nil {
+            whiteBalanceTint = UserDefaults.standard.float(forKey: "TANOO.camera.whiteBalanceTint")
+        }
+        if UserDefaults.standard.object(forKey: "TANOO.camera.zoomFactor") != nil {
+            zoomFactor = CGFloat(UserDefaults.standard.double(forKey: "TANOO.camera.zoomFactor"))
+        }
+        if UserDefaults.standard.object(forKey: "TANOO.camera.exposureBias") != nil {
+            exposureBias = UserDefaults.standard.float(forKey: "TANOO.camera.exposureBias")
+        }
+        if let data = UserDefaults.standard.data(forKey: takeCountersKey),
+           let decoded = try? JSONDecoder().decode([String: Int].self, from: data) {
+            takeCounters = decoded
         }
 
         super.init()
@@ -388,6 +496,7 @@ final class CameraController: NSObject, ObservableObject {
     func setZoom(_ value: CGFloat) {
         let target = min(max(value, minZoomFactor), maxZoomFactor)
         zoomFactor = target
+        UserDefaults.standard.set(Double(target), forKey: "TANOO.camera.zoomFactor")
         sessionQueue.async { [weak self] in
             guard let self, let device = self.currentDevice else { return }
             do {
@@ -405,6 +514,7 @@ final class CameraController: NSObject, ObservableObject {
     func setExposureBias(_ value: Float) {
         let target = min(max(value, minExposureBias), maxExposureBias)
         exposureBias = target
+        UserDefaults.standard.set(target, forKey: "TANOO.camera.exposureBias")
         sessionQueue.async { [weak self] in
             guard let self, let device = self.currentDevice else { return }
             do {
@@ -436,6 +546,185 @@ final class CameraController: NSObject, ObservableObject {
                     self.simulatedAperture = target
                     self.statusText = String(format: "Cinematic • F %.1f (จำลอง)", target)
                 }
+            }
+        }
+    }
+
+    func setControlMode(_ mode: CameraControlMode) {
+        controlMode = mode
+        if mode == .auto {
+            manualFocusEnabled = false
+            manualExposureEnabled = false
+            manualWhiteBalanceEnabled = false
+            focusExposureLocked = false
+            exposureBias = 0
+            UserDefaults.standard.set(Float(0), forKey: "TANOO.camera.exposureBias")
+        }
+
+        sessionQueue.async { [weak self] in
+            self?.applyManualControlsOnSessionQueue()
+        }
+    }
+
+    func setManualFocusEnabled(_ enabled: Bool) {
+        guard controlMode == .manual, manualFocusAvailable else {
+            manualFocusEnabled = false
+            return
+        }
+        manualFocusEnabled = enabled
+        focusExposureLocked = enabled
+        sessionQueue.async { [weak self] in
+            self?.applyManualControlsOnSessionQueue()
+        }
+    }
+
+    func setManualFocus(_ value: Float) {
+        guard controlMode == .manual, manualFocusEnabled, manualFocusAvailable else { return }
+        manualFocusPosition = min(max(value, 0), 1)
+        sessionQueue.async { [weak self] in
+            self?.applyManualControlsOnSessionQueue()
+        }
+    }
+
+    func setManualExposureEnabled(_ enabled: Bool) {
+        guard controlMode == .manual, manualExposureAvailable else {
+            manualExposureEnabled = false
+            return
+        }
+        manualExposureEnabled = enabled
+        sessionQueue.async { [weak self] in
+            self?.applyManualControlsOnSessionQueue()
+        }
+    }
+
+    func setManualISO(_ value: Float) {
+        guard controlMode == .manual, manualExposureEnabled, manualExposureAvailable else { return }
+        manualISO = min(max(value, minISO), maxISO)
+        sessionQueue.async { [weak self] in
+            self?.applyManualControlsOnSessionQueue()
+        }
+    }
+
+    func setManualShutterDenominator(_ value: Double) {
+        guard controlMode == .manual, manualExposureEnabled, manualExposureAvailable else { return }
+        manualShutterDenominator = min(
+            max(value, minShutterDenominator),
+            maxShutterDenominator
+        )
+        sessionQueue.async { [weak self] in
+            self?.applyManualControlsOnSessionQueue()
+        }
+    }
+
+    func setManualWhiteBalanceEnabled(_ enabled: Bool) {
+        guard controlMode == .manual, manualWhiteBalanceAvailable else {
+            manualWhiteBalanceEnabled = false
+            return
+        }
+        manualWhiteBalanceEnabled = enabled
+        sessionQueue.async { [weak self] in
+            self?.applyManualControlsOnSessionQueue()
+        }
+    }
+
+    func setWhiteBalanceTemperature(_ value: Float) {
+        guard controlMode == .manual,
+              manualWhiteBalanceEnabled,
+              manualWhiteBalanceAvailable else { return }
+        whiteBalanceTemperature = min(max(value, 2_500), 10_000)
+        sessionQueue.async { [weak self] in
+            self?.applyManualControlsOnSessionQueue()
+        }
+    }
+
+    func setWhiteBalanceTint(_ value: Float) {
+        guard controlMode == .manual,
+              manualWhiteBalanceEnabled,
+              manualWhiteBalanceAvailable else { return }
+        whiteBalanceTint = min(max(value, -150), 150)
+        sessionQueue.async { [weak self] in
+            self?.applyManualControlsOnSessionQueue()
+        }
+    }
+
+    private func applyManualControlsOnSessionQueue() {
+        guard let device = currentDevice else { return }
+
+        do {
+            try device.lockForConfiguration()
+
+            let clampedZoom = min(
+                max(zoomFactor, device.minAvailableVideoZoomFactor),
+                device.maxAvailableVideoZoomFactor
+            )
+            device.videoZoomFactor = clampedZoom
+
+            let clampedBias = min(
+                max(controlMode == .auto ? 0 : exposureBias, device.minExposureTargetBias),
+                device.maxExposureTargetBias
+            )
+            device.setExposureTargetBias(clampedBias, completionHandler: nil)
+
+            let supportsManualFocus = captureMode != .cinematic &&
+                device.isLockingFocusWithCustomLensPositionSupported
+            if controlMode == .manual, manualFocusEnabled, supportsManualFocus {
+                let position = min(max(manualFocusPosition, 0), 1)
+                device.setFocusModeLocked(lensPosition: position, completionHandler: nil)
+            } else if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            }
+
+            let supportsManualExposure = captureMode != .cinematic &&
+                device.isExposureModeSupported(.custom)
+            if controlMode == .manual, manualExposureEnabled, supportsManualExposure {
+                let format = device.activeFormat
+                let iso = min(max(manualISO, format.minISO), format.maxISO)
+                let requestedSeconds = 1.0 / max(manualShutterDenominator, 1)
+                var duration = CMTime(
+                    seconds: requestedSeconds,
+                    preferredTimescale: 1_000_000_000
+                )
+                if CMTimeCompare(duration, format.minExposureDuration) < 0 {
+                    duration = format.minExposureDuration
+                }
+                if CMTimeCompare(duration, format.maxExposureDuration) > 0 {
+                    duration = format.maxExposureDuration
+                }
+                device.setExposureModeCustom(duration: duration, iso: iso, completionHandler: nil)
+            } else if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+            }
+
+            let supportsManualWhiteBalance = captureMode != .cinematic &&
+                device.isWhiteBalanceModeSupported(.locked)
+            if controlMode == .manual,
+               manualWhiteBalanceEnabled,
+               supportsManualWhiteBalance {
+                let values = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
+                    temperature: min(max(whiteBalanceTemperature, 2_500), 10_000),
+                    tint: min(max(whiteBalanceTint, -150), 150)
+                )
+                var gains = device.deviceWhiteBalanceGains(for: values)
+                gains.redGain = min(max(gains.redGain, 1), device.maxWhiteBalanceGain)
+                gains.greenGain = min(max(gains.greenGain, 1), device.maxWhiteBalanceGain)
+                gains.blueGain = min(max(gains.blueGain, 1), device.maxWhiteBalanceGain)
+                device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+            } else if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                device.whiteBalanceMode = .continuousAutoWhiteBalance
+            }
+
+            device.unlockForConfiguration()
+
+            Task { @MainActor in
+                self.zoomFactor = clampedZoom
+                self.exposureBias = clampedBias
+                self.statusText = self.controlMode == .auto
+                    ? "PRO Controls กลับเป็น AUTO แล้ว"
+                    : "ใช้ค่ากล้อง Manual แล้ว"
+            }
+        } catch {
+            Task { @MainActor in
+                self.statusText = "ตั้งค่า Manual ไม่สำเร็จ: " + error.localizedDescription
             }
         }
     }
@@ -481,6 +770,7 @@ final class CameraController: NSObject, ObservableObject {
 
     func enableAutoFocus() {
         focusExposureLocked = false
+        manualFocusEnabled = false
 
         sessionQueue.async { [weak self] in
             guard let self, let device = self.currentDevice else { return }
@@ -643,7 +933,7 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
-    func startNewTake() {
+    func startNewTake(projectName: String = "") {
         guard !isRecording, !isPaused, !isStartingRecording, !isFinalizingTake, !isReconfiguring else {
             let message = isReconfiguring
                 ? "REC ยังไม่เริ่ม: กล้องกำลังเปลี่ยนคุณภาพ"
@@ -678,14 +968,16 @@ final class CameraController: NSObject, ObservableObject {
         }
 
         recordPreflightMessage = ""
+        prepareTakeIdentity(projectName: projectName)
         recordingSegments.removeAll()
+        recordingSegmentIndex = 0
         currentRecordingURL = nil
         recordingSeconds = 0
         isPaused = false
         stopAction = .finish
         resetDurationOnNextSegment = true
         isStartingRecording = true
-        statusText = "กำลังเตรียม REC…"
+        statusText = "กำลังเตรียม " + currentTakeName + "…"
 
         // All AVCaptureSession / MovieFileOutput operations are serialized
         // on the same queue. This removes the race that could happen after
@@ -1193,6 +1485,7 @@ final class CameraController: NSObject, ObservableObject {
 
         configureVideoConnection()
         updateCapabilities()
+        applyManualControlsOnSessionQueue()
 
         if manageSessionConfiguration {
             session.commitConfiguration()
@@ -1228,7 +1521,10 @@ final class CameraController: NSObject, ObservableObject {
         }
         if connection.isVideoMirroringSupported {
             connection.automaticallyAdjustsVideoMirroring = false
-            connection.isVideoMirrored = true
+            // The front preview remains mirrored for framing, but the movie
+            // connection records the real camera orientation so text and
+            // clothing logos read correctly in Photos.
+            connection.isVideoMirrored = false
         }
         if connection.isVideoStabilizationSupported {
             connection.preferredVideoStabilizationMode = .auto
@@ -1311,6 +1607,27 @@ final class CameraController: NSObject, ObservableObject {
         var maxA: Float = 16
         var aperture = simulatedAperture
         var supportsAperture = false
+        let supportsManualFocus = captureMode != .cinematic &&
+            device.isLockingFocusWithCustomLensPositionSupported
+        let supportsManualExposure = captureMode != .cinematic &&
+            device.isExposureModeSupported(.custom)
+        let supportsManualWhiteBalance = captureMode != .cinematic &&
+            device.isWhiteBalanceModeSupported(.locked)
+        let formatMinISO = device.activeFormat.minISO
+        let formatMaxISO = device.activeFormat.maxISO
+        let minExposureSeconds = max(
+            CMTimeGetSeconds(device.activeFormat.minExposureDuration),
+            0.000_001
+        )
+        let maxExposureSeconds = max(
+            CMTimeGetSeconds(device.activeFormat.maxExposureDuration),
+            minExposureSeconds
+        )
+        let formatMinShutterDenominator = max(1, 1.0 / maxExposureSeconds)
+        let formatMaxShutterDenominator = max(
+            formatMinShutterDenominator,
+            min(20_000, 1.0 / minExposureSeconds)
+        )
         var supportsPortraitEffect = false
         var portraitEffectIsEnabled = false
         var portraitEffectIsActive = false
@@ -1354,6 +1671,29 @@ final class CameraController: NSObject, ObservableObject {
             self.minSimulatedAperture = minA
             self.maxSimulatedAperture = maxA
             self.simulatedAperture = aperture
+            self.manualFocusAvailable = supportsManualFocus
+            self.manualExposureAvailable = supportsManualExposure
+            self.manualWhiteBalanceAvailable = supportsManualWhiteBalance
+            self.minISO = formatMinISO
+            self.maxISO = max(formatMaxISO, formatMinISO)
+            self.manualISO = min(max(self.manualISO, formatMinISO), max(formatMaxISO, formatMinISO))
+            self.minShutterDenominator = formatMinShutterDenominator
+            self.maxShutterDenominator = formatMaxShutterDenominator
+            self.manualShutterDenominator = min(
+                max(self.manualShutterDenominator, formatMinShutterDenominator),
+                formatMaxShutterDenominator
+            )
+
+            if self.controlMode == .manual,
+               !supportsManualFocus,
+               !supportsManualExposure,
+               !supportsManualWhiteBalance {
+                self.controlMode = .auto
+                self.manualFocusEnabled = false
+                self.manualExposureEnabled = false
+                self.manualWhiteBalanceEnabled = false
+                self.statusText = "Format นี้ไม่รองรับ Manual — กลับเป็น AUTO อย่างปลอดภัย"
+            }
 
             if self.captureMode == .cinematic && !cine {
                 self.captureMode = .video
@@ -1365,6 +1705,66 @@ final class CameraController: NSObject, ObservableObject {
                 self.captureMode = .video
                 self.statusText = "กล้องหน้า/Format นี้ไม่รองรับ ProRes RAW — ใช้ VIDEO แทน"
             }
+        }
+    }
+
+    private func prepareTakeIdentity(projectName: String) {
+        let baseName = sanitizedTakeBaseName(projectName)
+        let key = baseName.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: .current
+        )
+        let nextNumber = (takeCounters[key] ?? 0) + 1
+        takeCounters[key] = nextNumber
+        if let data = try? JSONEncoder().encode(takeCounters) {
+            UserDefaults.standard.set(data, forKey: takeCountersKey)
+        }
+
+        currentTakeName = baseName + " Take " + String(nextNumber)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TANOO-" + UUID().uuidString, isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        currentTakeDirectoryURL = directory
+    }
+
+    private func sanitizedTakeBaseName(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let source = trimmed.isEmpty ? "TANOO" : trimmed
+        let invalid = CharacterSet(charactersIn: "/\\?%*|\"<>:\r\n\t")
+            .union(.controlCharacters)
+        let pieces = source.components(separatedBy: invalid)
+        let sanitized = pieces
+            .joined(separator: " ")
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let limited = String(sanitized.prefix(80))
+        return limited.isEmpty ? "TANOO" : limited
+    }
+
+    private func takeFileURL(fileName: String) -> URL {
+        let directory = currentTakeDirectoryURL ?? FileManager.default.temporaryDirectory
+        return directory
+            .appendingPathComponent(fileName)
+            .appendingPathExtension("mov")
+    }
+
+    private func finalTakeURL() -> URL {
+        takeFileURL(fileName: currentTakeName)
+    }
+
+    private func moveSingleSegmentToFinalURL(_ sourceURL: URL) -> URL {
+        let destination = finalTakeURL()
+        guard sourceURL != destination else { return sourceURL }
+        try? FileManager.default.removeItem(at: destination)
+        do {
+            try FileManager.default.moveItem(at: sourceURL, to: destination)
+            return destination
+        } catch {
+            return sourceURL
         }
     }
 
@@ -1388,19 +1788,22 @@ final class CameraController: NSObject, ObservableObject {
         let directory = FileManager.default.temporaryDirectory
         guard let files = try? FileManager.default.contentsOfDirectory(
             at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey]
+            includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey]
         ) else { return }
 
         let preserved = Set(recordingSegments + [currentRecordingURL].compactMap { $0 })
         let staleBefore = Date().addingTimeInterval(-300)
 
-        for file in files
-        where file.lastPathComponent.hasPrefix("TANOO-") &&
-              file.pathExtension.lowercased() == "mov" &&
-              !preserved.contains(file) {
-            let values = try? file.resourceValues(forKeys: [.contentModificationDateKey])
+        for file in files where file.lastPathComponent.hasPrefix("TANOO-") {
+            if file == currentTakeDirectoryURL { continue }
+            let values = try? file.resourceValues(
+                forKeys: [.contentModificationDateKey, .isDirectoryKey]
+            )
             if let modified = values?.contentModificationDate, modified < staleBefore {
-                try? FileManager.default.removeItem(at: file)
+                if values?.isDirectory == true ||
+                    (file.pathExtension.lowercased() == "mov" && !preserved.contains(file)) {
+                    try? FileManager.default.removeItem(at: file)
+                }
             }
         }
     }
@@ -1420,17 +1823,19 @@ final class CameraController: NSObject, ObservableObject {
         prepareCameraAudioSession()
         configureVideoConnection()
 
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("TANOO-" + UUID().uuidString)
-            .appendingPathExtension("mov")
+        recordingSegmentIndex += 1
+        let url = takeFileURL(
+            fileName: currentTakeName + " Segment " + String(recordingSegmentIndex)
+        )
+        try? FileManager.default.removeItem(at: url)
 
         currentRecordingURL = url
 
         Task { @MainActor in
             self.recordPreflightMessage = ""
             self.statusText = self.recordingSegments.isEmpty
-                ? "กำลังเริ่ม REC…"
-                : "กำลังบันทึกต่อ…"
+                ? "กำลังเริ่ม " + self.currentTakeName + "…"
+                : self.currentTakeName + " • กำลังบันทึกต่อ…"
         }
 
         movieOutput.startRecording(to: url, recordingDelegate: self)
@@ -1449,12 +1854,13 @@ final class CameraController: NSObject, ObservableObject {
 
         if recordingSegments.count == 1, let url = recordingSegments.first {
             recordingSegments.removeAll()
+            let finalURL = moveSingleSegmentToFinalURL(url)
             if shouldRenderSoftwareBackgroundBlur {
                 statusText = "กำลังสร้างฉากหลังเบลอใน TANOO…"
-                renderSoftwareBackgroundBlur(sourceURL: url)
+                renderSoftwareBackgroundBlur(sourceURL: finalURL)
             } else {
                 statusText = "กำลังบันทึกลง Photos…"
-                saveVideoToPhotos(url)
+                saveVideoToPhotos(finalURL)
             }
             return
         }
@@ -1462,9 +1868,8 @@ final class CameraController: NSObject, ObservableObject {
         statusText = "กำลังรวมช่วงวิดีโอ…"
 
         let segments = recordingSegments
-        let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("TANOO-MERGED-" + UUID().uuidString)
-            .appendingPathExtension("mov")
+        let outputURL = finalTakeURL()
+        try? FileManager.default.removeItem(at: outputURL)
 
         sessionQueue.async { [weak self] in
             guard let self else { return }
@@ -1577,9 +1982,8 @@ final class CameraController: NSObject, ObservableObject {
         }
 
         let asset = AVAsset(url: sourceURL)
-        let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("TANOO-BLUR-" + UUID().uuidString)
-            .appendingPathExtension("mov")
+        let outputURL = takeFileURL(fileName: currentTakeName + " Rendered")
+        try? FileManager.default.removeItem(at: outputURL)
         let blurRadius = 8.0 + (min(max(softwareBackgroundBlurAmount, 0.15), 1.0) * 26.0)
 
         let composition = AVVideoComposition(
@@ -1673,9 +2077,18 @@ final class CameraController: NSObject, ObservableObject {
     }
 
     private func saveVideoToPhotos(_ url: URL) {
+        let savedTakeName = currentTakeName
+        let takeDirectory = currentTakeDirectoryURL
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
             guard status == .authorized || status == .limited else {
                 try? FileManager.default.removeItem(at: url)
+                if let directory = takeDirectory,
+                   directory.lastPathComponent.hasPrefix("TANOO-") {
+                    try? FileManager.default.removeItem(at: directory)
+                    if self?.currentTakeDirectoryURL == directory {
+                        self?.currentTakeDirectoryURL = nil
+                    }
+                }
                 self?.refreshDiskSpace()
                 Task { @MainActor in
                     self?.statusText = "วิดีโอถ่ายสำเร็จ แต่ไม่ได้รับสิทธิ์บันทึกลง Photos"
@@ -1685,11 +2098,17 @@ final class CameraController: NSObject, ObservableObject {
             }
 
             PHPhotoLibrary.shared().performChanges({
-                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+                let request = PHAssetCreationRequest.forAsset()
+                let options = PHAssetResourceCreationOptions()
+                // Photos controls what it displays in its UI, but this keeps
+                // the requested Take name as the original resource filename.
+                options.originalFilename = savedTakeName + ".mov"
+                request.addResource(with: .video, fileURL: url, options: options)
             }) { success, error in
                 Task { @MainActor in
                     if success {
-                        self?.statusText = "บันทึกวิดีโอลง Photos แล้ว"
+                        self?.lastSavedTakeName = savedTakeName
+                        self?.statusText = "บันทึก " + savedTakeName + " ลง Photos แล้ว"
                         self?.completedTakeCount += 1
                         self?.isFinalizingTake = false
                     } else {
@@ -1698,6 +2117,13 @@ final class CameraController: NSObject, ObservableObject {
                     }
                 }
                 try? FileManager.default.removeItem(at: url)
+                if let directory = takeDirectory,
+                   directory.lastPathComponent.hasPrefix("TANOO-") {
+                    try? FileManager.default.removeItem(at: directory)
+                    if self?.currentTakeDirectoryURL == directory {
+                        self?.currentTakeDirectoryURL = nil
+                    }
+                }
                 self?.refreshDiskSpace()
             }
         }
@@ -2207,7 +2633,20 @@ final class PreviewView: UIView {
         precondition(Thread.isMainThread)
         if previewLayer.session !== session {
             previewLayer.session = session
+            configureFrontPreviewMirroring()
+            DispatchQueue.main.async { [weak self] in
+                self?.configureFrontPreviewMirroring()
+            }
         }
+    }
+
+    private func configureFrontPreviewMirroring() {
+        // This only touches the PreviewLayer connection, once when attaching
+        // the session. The movie-output connection is configured separately.
+        guard let connection = previewLayer.connection,
+              connection.isVideoMirroringSupported else { return }
+        connection.automaticallyAdjustsVideoMirroring = false
+        connection.isVideoMirrored = true
     }
 
     func showFocusIndicator(at point: CGPoint, locked: Bool) {
@@ -2473,7 +2912,6 @@ private struct MovableResizableTeleprompter: View {
 private enum RecordingCountdownAction: Equatable {
     case newRecording
     case resume
-    case repeatLatest
 
     var label: String {
         switch self {
@@ -2481,10 +2919,13 @@ private enum RecordingCountdownAction: Equatable {
             return "เริ่มบันทึก"
         case .resume:
             return "บันทึกต่อ"
-        case .repeatLatest:
-            return "อัดซ้ำเทคล่าสุด"
         }
     }
+}
+
+private enum PendingTakeAfterSave {
+    case newTake(TeleprompterPosition)
+    case repeatTake(TeleprompterPosition)
 }
 
 struct CameraStudioView: View {
@@ -2502,8 +2943,9 @@ struct CameraStudioView: View {
     @State private var countdownRemaining: Int?
     @State private var countdownToken = UUID()
     @State private var countdownAction: RecordingCountdownAction?
-    @State private var countdownOriginalPosition: TeleprompterPosition?
     @State private var segmentStartPosition: TeleprompterPosition?
+    @State private var lastTakeStartPosition: TeleprompterPosition?
+    @State private var pendingTakeAfterSave: PendingTakeAfterSave?
 
     var body: some View {
         ZStack {
@@ -2591,7 +3033,7 @@ struct CameraStudioView: View {
             camera.stop()
             horizonMonitor.stop()
             countdownAction = nil
-            countdownOriginalPosition = nil
+            pendingTakeAfterSave = nil
             teleprompter.setUsesExternalSpeech(false)
             cameraStarted = false
         }
@@ -2618,6 +3060,9 @@ struct CameraStudioView: View {
                     teleprompter.pause()
                 }
             }
+        }
+        .onChange(of: camera.completedTakeCount) { _ in
+            continuePendingTakeAfterSave()
         }
         .onChange(of: camera.resolution) { _ in
             if cameraStarted { camera.reconfigure() }
@@ -2685,6 +3130,8 @@ struct CameraStudioView: View {
 
             Spacer()
 
+            Text(camera.currentTakeName)
+                .lineLimit(1)
             Text(camera.resolution.rawValue)
             Text("·")
             Text(String(Int(camera.frameRate)) + " FPS")
@@ -2954,6 +3401,7 @@ struct CameraStudioView: View {
                 .disabled(!cameraStarted)
 
                 backgroundBlurControl
+                manualCameraControls
 
                 HStack(spacing: 14) {
                     Toggle("Grid", isOn: $showGrid)
@@ -2963,7 +3411,7 @@ struct CameraStudioView: View {
                 .font(.caption2)
 
                 if bluetoothShutterEnabled {
-                    Text("ปุ่มเพิ่มเสียง/รีโมทตอบสนองทันที: REC/Pause • หลัง Pause กด 1 ครั้ง = เริ่มนับถอยหลังเพื่อ Resume • กดซ้ำระหว่างนับ = เปลี่ยนเป็น Repeat เทคล่าสุด")
+                    Text("ปุ่มเพิ่มเสียง/รีโมทตอบสนองทันที: REC/Pause • หลัง Pause กด 1 ครั้ง = Resume • กดซ้ำระหว่างนับ = บันทึก Take เดิม แล้วสร้าง Repeat Take เป็นไฟล์ใหม่")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -3045,26 +3493,58 @@ struct CameraStudioView: View {
                             }
                             .accessibilityLabel("Pause Recording")
                         } else if camera.isPaused {
-                            HStack(spacing: 8) {
+                            HStack(spacing: 6) {
                                 Button {
                                     resumeVideo()
                                 } label: {
                                     Image(systemName: "play.fill")
                                         .font(.headline.bold())
-                                        .frame(width: 48, height: 48)
+                                        .frame(width: 42, height: 42)
                                         .background(.white.opacity(0.17), in: Circle())
                                 }
                                 .accessibilityLabel("Resume Recording")
+
+                                Button {
+                                    requestNewTake()
+                                } label: {
+                                    Image(systemName: "plus")
+                                        .font(.headline.bold())
+                                        .frame(width: 42, height: 42)
+                                        .background(.blue.opacity(0.78), in: Circle())
+                                }
+                                .accessibilityLabel("บันทึก Take ปัจจุบันแล้วเริ่ม New Take")
 
                                 Button {
                                     requestRepeatTake()
                                 } label: {
                                     Image(systemName: "repeat")
                                         .font(.headline.bold())
-                                        .frame(width: 48, height: 48)
+                                        .frame(width: 42, height: 42)
                                         .background(.orange.opacity(0.78), in: Circle())
                                 }
-                                .accessibilityLabel("เพิ่มช่วงอัดซ้ำจากจุดเริ่มของเทคล่าสุด")
+                                .accessibilityLabel("บันทึก Take ปัจจุบันแล้วสร้าง Repeat Take ใหม่")
+                            }
+                        } else if !camera.lastSavedTakeName.isEmpty {
+                            HStack(spacing: 6) {
+                                Button {
+                                    requestNewTake()
+                                } label: {
+                                    Image(systemName: "plus")
+                                        .font(.headline.bold())
+                                        .frame(width: 42, height: 42)
+                                        .background(.blue.opacity(0.78), in: Circle())
+                                }
+                                .accessibilityLabel("New Take")
+
+                                Button {
+                                    requestRepeatTake()
+                                } label: {
+                                    Image(systemName: "repeat")
+                                        .font(.headline.bold())
+                                        .frame(width: 42, height: 42)
+                                        .background(.orange.opacity(0.78), in: Circle())
+                                }
+                                .accessibilityLabel("Repeat Take")
                             }
                         } else {
                             Color.clear.frame(width: 52, height: 52)
@@ -3209,6 +3689,10 @@ struct CameraStudioView: View {
                     .controlSize(.small)
                     .disabled(activeTake)
                 }
+            } else if camera.captureMode == .cinematic {
+                Text("กล้องหรือ Format นี้ไม่รองรับ simulated aperture จึงปิดตัวปรับ F เพื่อความปลอดภัย")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             } else {
                 HStack(spacing: 8) {
                     Text("TANOO Blur ใช้ได้ในโหมด VIDEO")
@@ -3224,6 +3708,157 @@ struct CameraStudioView: View {
                     .controlSize(.small)
                     .disabled(activeTake)
                 }
+            }
+        }
+        .padding(9)
+        .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    @ViewBuilder
+    private var manualCameraControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Label("PRO Manual", systemImage: "dial.medium")
+                    .font(.caption.bold())
+
+                Picker(
+                    "Camera Control",
+                    selection: Binding(
+                        get: { camera.controlMode },
+                        set: { camera.setControlMode($0) }
+                    )
+                ) {
+                    ForEach(CameraControlMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .disabled(activeTake)
+
+                Button("Auto") {
+                    camera.setControlMode(.auto)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(activeTake)
+            }
+
+            if camera.controlMode == .manual {
+                if camera.captureMode == .cinematic {
+                    Text("CINE ควบคุม Focus/Exposure/WB ผ่าน Cinematic API จึงไม่เปิด Manual ทั่วไป • ค่า F ยังปรับได้ด้านบน")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Toggle(
+                        "Manual Focus",
+                        isOn: Binding(
+                            get: { camera.manualFocusEnabled },
+                            set: { camera.setManualFocusEnabled($0) }
+                        )
+                    )
+                    .font(.caption2.bold())
+                    .disabled(activeTake || !camera.manualFocusAvailable)
+
+                    if camera.manualFocusAvailable && camera.manualFocusEnabled {
+                        slider(
+                            title: "Focus",
+                            valueText: String(format: "%.0f%%", camera.manualFocusPosition * 100),
+                            value: Binding(
+                                get: { Double(camera.manualFocusPosition) },
+                                set: { camera.setManualFocus(Float($0)) }
+                            ),
+                            range: 0...1
+                        )
+                        .disabled(activeTake)
+                    } else if !camera.manualFocusAvailable {
+                        Text("Format นี้ไม่รองรับ Manual Focus — ใช้ AF Auto / Tap Focus")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Toggle(
+                        "Manual ISO + Shutter",
+                        isOn: Binding(
+                            get: { camera.manualExposureEnabled },
+                            set: { camera.setManualExposureEnabled($0) }
+                        )
+                    )
+                    .font(.caption2.bold())
+                    .disabled(activeTake || !camera.manualExposureAvailable)
+
+                    if camera.manualExposureAvailable && camera.manualExposureEnabled {
+                        slider(
+                            title: "ISO",
+                            valueText: String(Int(camera.manualISO.rounded())),
+                            value: Binding(
+                                get: { Double(camera.manualISO) },
+                                set: { camera.setManualISO(Float($0)) }
+                            ),
+                            range: Double(camera.minISO)...Double(max(camera.maxISO, camera.minISO + 1))
+                        )
+                        .disabled(activeTake)
+
+                        slider(
+                            title: "Shutter",
+                            valueText: "1/" + String(Int(camera.manualShutterDenominator.rounded())),
+                            value: Binding(
+                                get: { camera.manualShutterDenominator },
+                                set: { camera.setManualShutterDenominator($0) }
+                            ),
+                            range: camera.minShutterDenominator...max(
+                                camera.maxShutterDenominator,
+                                camera.minShutterDenominator + 1
+                            )
+                        )
+                        .disabled(activeTake)
+                    } else if !camera.manualExposureAvailable {
+                        Text("Format นี้ไม่รองรับ ISO/Shutter แบบ Manual — ใช้ Auto Exposure")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Toggle(
+                        "Manual White Balance",
+                        isOn: Binding(
+                            get: { camera.manualWhiteBalanceEnabled },
+                            set: { camera.setManualWhiteBalanceEnabled($0) }
+                        )
+                    )
+                    .font(.caption2.bold())
+                    .disabled(activeTake || !camera.manualWhiteBalanceAvailable)
+
+                    if camera.manualWhiteBalanceAvailable && camera.manualWhiteBalanceEnabled {
+                        slider(
+                            title: "Temperature",
+                            valueText: String(Int(camera.whiteBalanceTemperature.rounded())) + "K",
+                            value: Binding(
+                                get: { Double(camera.whiteBalanceTemperature) },
+                                set: { camera.setWhiteBalanceTemperature(Float($0)) }
+                            ),
+                            range: 2_500...10_000
+                        )
+                        .disabled(activeTake)
+
+                        slider(
+                            title: "Tint",
+                            valueText: String(format: "%+.0f", camera.whiteBalanceTint),
+                            value: Binding(
+                                get: { Double(camera.whiteBalanceTint) },
+                                set: { camera.setWhiteBalanceTint(Float($0)) }
+                            ),
+                            range: -150...150
+                        )
+                        .disabled(activeTake)
+                    } else if !camera.manualWhiteBalanceAvailable {
+                        Text("Format นี้ไม่รองรับ White Balance แบบ Manual — ใช้ Auto WB")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } else {
+                Text("AUTO ใช้ Continuous AF / Auto Exposure / Auto White Balance • Tap Focus และ AE/AF Lock ยังใช้ได้")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(9)
@@ -3247,7 +3882,6 @@ struct CameraStudioView: View {
             countdownToken = UUID()
             countdownRemaining = nil
             countdownAction = nil
-            countdownOriginalPosition = nil
             segmentStartPosition = nil
             camera.finishRecording()
             camera.stopSpeech()
@@ -3281,8 +3915,65 @@ struct CameraStudioView: View {
     }
 
     private func requestRepeatTake() {
-        guard camera.isPaused else { return }
-        startCountdown(for: .repeatLatest)
+        guard !camera.isRecording,
+              !camera.isStartingRecording,
+              !camera.isFinalizingTake else { return }
+
+        cancelCountdown()
+        let position = lastTakeStartPosition ?? teleprompter.capturePosition()
+
+        if camera.isPaused {
+            pendingTakeAfterSave = .repeatTake(position)
+            segmentStartPosition = nil
+            camera.finishRecording()
+            camera.stopSpeech()
+        } else {
+            teleprompter.restorePosition(position)
+            startCountdown(for: .newRecording)
+        }
+    }
+
+    private func requestNewTake() {
+        guard !camera.isRecording,
+              !camera.isStartingRecording,
+              !camera.isFinalizingTake else { return }
+
+        cancelCountdown()
+        let position = teleprompter.capturePosition()
+
+        if camera.isPaused {
+            pendingTakeAfterSave = .newTake(position)
+            segmentStartPosition = nil
+            camera.finishRecording()
+            camera.stopSpeech()
+        } else {
+            startCountdown(for: .newRecording)
+        }
+    }
+
+    private func continuePendingTakeAfterSave() {
+        guard let pendingTakeAfterSave else { return }
+        if camera.isFinalizingTake {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                continuePendingTakeAfterSave()
+            }
+            return
+        }
+        guard !camera.isRecording,
+              !camera.isStartingRecording,
+              !camera.isPaused else { return }
+
+        self.pendingTakeAfterSave = nil
+        let position: TeleprompterPosition
+        switch pendingTakeAfterSave {
+        case .newTake(let value), .repeatTake(let value):
+            position = value
+        }
+
+        teleprompter.restorePosition(position)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            startCountdown(for: .newRecording)
+        }
     }
 
     private func handleRemoteVolumeUp() {
@@ -3315,11 +4006,7 @@ struct CameraStudioView: View {
     private func cancelCountdown() {
         countdownToken = UUID()
         countdownRemaining = nil
-        if countdownAction == .repeatLatest, let countdownOriginalPosition {
-            teleprompter.restorePosition(countdownOriginalPosition)
-        }
         countdownAction = nil
-        countdownOriginalPosition = nil
     }
 
     private func startCountdown(for action: RecordingCountdownAction) {
@@ -3334,25 +4021,10 @@ struct CameraStudioView: View {
         countdownToken = UUID()
         countdownRemaining = nil
 
-        if countdownAction == .repeatLatest,
-           action != .repeatLatest,
-           let countdownOriginalPosition {
-            teleprompter.restorePosition(countdownOriginalPosition)
-            self.countdownOriginalPosition = nil
-        }
-
-        if action == .repeatLatest, countdownAction != .repeatLatest {
-            countdownOriginalPosition = teleprompter.capturePosition()
-            if let segmentStartPosition {
-                teleprompter.restorePosition(segmentStartPosition)
-            }
-        }
-
         countdownAction = action
 
         guard countdownSeconds > 0 else {
             countdownAction = nil
-            countdownOriginalPosition = nil
             performCountdownAction(action)
             return
         }
@@ -3371,7 +4043,6 @@ struct CameraStudioView: View {
             guard countdownToken == token else { return }
             countdownRemaining = nil
             countdownAction = nil
-            countdownOriginalPosition = nil
             performCountdownAction(action)
         }
     }
@@ -3383,20 +4054,20 @@ struct CameraStudioView: View {
         case .resume:
             segmentStartPosition = teleprompter.capturePosition()
             camera.resumeRecording()
-        case .repeatLatest:
-            camera.resumeRecording()
         }
     }
 
     private func beginRecording() {
         guard shutterEnabled else { return }
 
-        segmentStartPosition = teleprompter.capturePosition()
+        let startPosition = teleprompter.capturePosition()
+        segmentStartPosition = startPosition
+        lastTakeStartPosition = startPosition
         if teleprompter.isRunning {
             teleprompter.pause()
         }
 
-        camera.startNewTake()
+        camera.startNewTake(projectName: teleprompter.projectName)
 
         // If recording never reaches didStartRecording, keep the prompt stopped.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
