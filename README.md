@@ -19,10 +19,10 @@ Native iPhone teleprompter that uses Apple's Live Picture in Picture so the prom
 - Black overlay opacity
 - 1–6 prompt segments visible in PiP (default 3)
 - Local project persistence
-- Pause → Resume → Stop และ Repeat Take โดยอัดทุกช่วงต่อในงานเดียว และรวมเป็นวิดีโอเดียวเมื่อกด Stop
-- Repeat Take ย้อน Teleprompter ไปจุดเริ่มของเทคล่าสุด แล้วเพิ่มช่วงอัดซ้ำต่อท้ายโดยไม่ลบช่วงเดิม
-- Resume และ Repeat Take ใช้ Countdown เดียวกับการเริ่มอัดใหม่
-- Bluetooth selfie shutter / ปุ่มเพิ่มเสียงตอบสนองทันทีโดยไม่รอแยก single/double press: หลัง Pause กดหนึ่งครั้งเพื่อเริ่ม Countdown ของ Resume และกดซ้ำระหว่าง Countdown เพื่อเปลี่ยนเป็น Repeat Take
+- Pause → Resume → Stop ยังรวมทุกช่วงใน Take เดียวเป็นวิดีโอไฟล์เดียว
+- New Take และ Repeat Take จะบันทึก Take เดิมลง Photos ก่อน แล้วสร้างไฟล์ Take ใหม่โดยไม่ลบไฟล์ก่อนหน้า
+- ชื่อต้นฉบับใช้ `[Script] Take 1.mov`, `[Script] Take 2.mov` และจำเลขล่าสุดแยกตามชื่อ Script
+- Bluetooth selfie shutter / ปุ่มเพิ่มเสียงตอบสนองทันที: กดระหว่าง REC เพื่อ Pause, กดหลัง Pause เพื่อ Resume และกดซ้ำระหว่าง Countdown เพื่อบันทึก Take เดิมแล้วเริ่ม Repeat Take เป็นไฟล์ใหม่
 - Grid และ Level/Horizon overlay ที่เปิดปิดและจำค่าได้
 - เลือกจำนวนบรรทัด Teleprompter 1–6 บรรทัด (ค่าเริ่มต้น 3)
 - ตรวจ codec จากกล้องจริงก่อนแสดง ProRes RAW; ไม่ใช้ชื่อ RAW กับไฟล์ HEVC/H.264
@@ -31,6 +31,8 @@ Native iPhone teleprompter that uses Apple's Live Picture in Picture so the prom
 - iOS 15–25 รองรับ System Portrait Effect จาก Control Center พร้อมตรวจสถานะ Active และเลือก Format/FPS ที่รองรับอัตโนมัติ
 - TANOO Blur ทำ Person Segmentation และเบลอพื้นหลังลงในวิดีโอไฟล์สุดท้ายภายในแอป ไม่ต้องมีปุ่ม Portrait ใน Control Center
 - ปรับระดับ TANOO Blur ได้ 15–100% ใช้ VIDEO 1080p 30fps เพื่อความเสถียร และประมวลผลวิดีโอรวมทุกเทคหลัง Stop โดยยังคงเสียงไว้
+- Preview กล้องหน้าเป็นกระจก แต่ recording connection บันทึกภาพจริงที่ตัวหนังสืออ่านถูกด้าน โดยไม่ export พลิกภาพภายหลัง
+- PRO Manual มี Auto/Manual, Manual Focus, Exposure Compensation, ISO, Shutter, Temperature/Tint, Zoom และ Auto reset พร้อม clamp ตาม Format จริง
 
 ## Important iOS limitation
 

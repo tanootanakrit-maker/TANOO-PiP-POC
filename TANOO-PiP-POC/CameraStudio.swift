@@ -154,8 +154,8 @@ final class CameraController: NSObject, ObservableObject {
     @Published var simulatedAperture: Float = 2.8 {
         didSet { UserDefaults.standard.set(simulatedAperture, forKey: "TANOO.camera.simulatedAperture") }
     }
-    @Published private(set) var minSimulatedAperture: Float = 1.4
-    @Published private(set) var maxSimulatedAperture: Float = 16
+    @Published private(set) var minSimulatedAperture: Float = 0
+    @Published private(set) var maxSimulatedAperture: Float = 0
     @Published var softwareBackgroundBlurEnabled = true {
         didSet {
             UserDefaults.standard.set(
@@ -473,6 +473,16 @@ final class CameraController: NSObject, ObservableObject {
         sessionQueue.async { [weak self] in
             self?.updateCapabilities()
         }
+    }
+
+    func updateTakePreview(projectName: String) {
+        guard !isRecording, !isPaused, !isStartingRecording, !isFinalizingTake else { return }
+        let baseName = sanitizedTakeBaseName(projectName)
+        let key = baseName.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: .current
+        )
+        currentTakeName = baseName + " Take " + String((takeCounters[key] ?? 0) + 1)
     }
 
     func supportsMode(_ mode: CameraCaptureMode) -> Bool {
@@ -1603,8 +1613,8 @@ final class CameraController: NSObject, ObservableObject {
 
         var minZoom = device.minAvailableVideoZoomFactor
         var maxZoom = min(device.maxAvailableVideoZoomFactor, 3.0)
-        var minA: Float = 1.4
-        var maxA: Float = 16
+        var minA: Float = 0
+        var maxA: Float = 0
         var aperture = simulatedAperture
         var supportsAperture = false
         let supportsManualFocus = captureMode != .cinematic &&
@@ -3023,6 +3033,7 @@ struct CameraStudioView: View {
                     teleprompter.receiveExternalTranscript(transcript)
                 }
             }
+            camera.updateTakePreview(projectName: teleprompter.projectName)
             if showLevel { horizonMonitor.start() }
         }
         .onDisappear {
@@ -3039,6 +3050,9 @@ struct CameraStudioView: View {
         }
         .onChange(of: teleprompter.mode) { _ in
             syncSpeech()
+        }
+        .onChange(of: teleprompter.projectName) { value in
+            camera.updateTakePreview(projectName: value)
         }
         .onChange(of: camera.isRecording) { recording in
             if recording {
@@ -3062,12 +3076,23 @@ struct CameraStudioView: View {
             }
         }
         .onChange(of: camera.completedTakeCount) { _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                camera.updateTakePreview(projectName: teleprompter.projectName)
+            }
             continuePendingTakeAfterSave()
         }
-        .onChange(of: camera.resolution) { _ in
+        .onChange(of: camera.resolution) { newResolution in
+            if newResolution == .uhd4K,
+               camera.captureMode == .video,
+               camera.softwareBackgroundBlurEnabled {
+                camera.softwareBackgroundBlurEnabled = false
+            }
             if cameraStarted { camera.reconfigure() }
         }
         .onChange(of: camera.frameRate) { _ in
+            if cameraStarted { camera.reconfigure() }
+        }
+        .onChange(of: camera.softwareBackgroundBlurEnabled) { _ in
             if cameraStarted { camera.reconfigure() }
         }
         .onChange(of: showLevel) { enabled in
