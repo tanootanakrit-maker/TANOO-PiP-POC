@@ -269,6 +269,10 @@ final class CameraController: NSObject, ObservableObject {
             takeCounters = decoded
         }
 
+        // This device uses the stable VIDEO pipeline. Hide and ignore saved
+        // CINE/PRO/RAW selections that the front camera cannot actually use.
+        captureMode = .video
+
         super.init()
         refreshDiskSpace()
     }
@@ -558,6 +562,20 @@ final class CameraController: NSObject, ObservableObject {
                 }
             }
         }
+    }
+
+    func setSoftwareAperture(_ value: Float) {
+        let minimum: Float = 1.4
+        let maximum: Float = 16
+        let target = min(max(value, minimum), maximum)
+        simulatedAperture = target
+
+        // Map the camera-style F scale onto TANOO's segmentation blur:
+        // low F = stronger blur, high F = weaker blur.
+        let normalized = Double((target - minimum) / (maximum - minimum))
+        softwareBackgroundBlurAmount = 1.0 - (normalized * 0.85)
+        softwareBackgroundBlurEnabled = true
+        statusText = String(format: "TANOO Blur • F %.1f (จำลอง)", target)
     }
 
     func setControlMode(_ mode: CameraControlMode) {
@@ -959,7 +977,7 @@ final class CameraController: NSObject, ObservableObject {
         let freeGB = freeDiskSpaceGB()
         let minimumGB: Double
         if softwareBackgroundBlurEnabled && captureMode == .video {
-            minimumGB = 2.0
+            minimumGB = resolution == .uhd4K ? 4.0 : 2.0
         } else {
             minimumGB = resolution == .uhd4K ? 2.0 : 1.0
         }
@@ -1304,12 +1322,6 @@ final class CameraController: NSObject, ObservableObject {
         var selectedResolution = resolution
         var selectedFPS = frameRate
         var configurationMessage: String?
-
-        if softwareBackgroundBlurEnabled && captureMode == .video {
-            selectedResolution = .hd1080
-            selectedFPS = 30
-            configurationMessage = "TANOO Blur ใช้ 1080p 30fps เพื่อความเสถียร"
-        }
 
         if captureMode == .video {
             let requestedPreset: AVCaptureSession.Preset =
@@ -1980,8 +1992,7 @@ final class CameraController: NSObject, ObservableObject {
 
     private var shouldRenderSoftwareBackgroundBlur: Bool {
         softwareBackgroundBlurEnabled &&
-            captureMode == .video &&
-            !portraitEffectActive
+            captureMode == .video
     }
 
     private func renderSoftwareBackgroundBlur(sourceURL: URL) {
@@ -2004,7 +2015,7 @@ final class CameraController: NSObject, ObservableObject {
                     let source = request.sourceImage.clampedToExtent()
                     let segmentation = CIFilter.personSegmentation()
                     segmentation.inputImage = source
-                    segmentation.qualityLevel = 1
+                    segmentation.qualityLevel = 0
 
                     guard var mask = segmentation.outputImage,
                           mask.extent.width > 0,
@@ -2022,11 +2033,27 @@ final class CameraController: NSObject, ObservableObject {
                             y: extent.minY - mask.extent.minY
                         ))
                         .cropped(to: extent)
+                        // CIPersonSegmentation stores the person probability
+                        // in the red channel. Convert it to a real grayscale
+                        // mask and then to alpha; using the original alpha
+                        // channel makes the entire frame opaque and prevents
+                        // the background blur from appearing.
+                        .applyingFilter(
+                            "CIColorMatrix",
+                            parameters: [
+                                "inputRVector": CIVector(x: 1, y: 0, z: 0, w: 0),
+                                "inputGVector": CIVector(x: 1, y: 0, z: 0, w: 0),
+                                "inputBVector": CIVector(x: 1, y: 0, z: 0, w: 0),
+                                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+                                "inputBiasVector": CIVector(x: 0, y: 0, z: 0, w: 1)
+                            ]
+                        )
                         .applyingFilter(
                             "CIGaussianBlur",
                             parameters: [kCIInputRadiusKey: 1.8]
                         )
                         .cropped(to: extent)
+                        .applyingFilter("CIMaskToAlpha")
 
                     let blurredBackground = source
                         .applyingFilter(
@@ -2037,7 +2064,7 @@ final class CameraController: NSObject, ObservableObject {
 
                     let result = source
                         .applyingFilter(
-                            "CIBlendWithMask",
+                            "CIBlendWithAlphaMask",
                             parameters: [
                                 kCIInputBackgroundImageKey: blurredBackground,
                                 kCIInputMaskImageKey: mask
@@ -2050,10 +2077,16 @@ final class CameraController: NSObject, ObservableObject {
             }
         )
 
-        let preset = AVAssetExportSession.exportPresets(compatibleWith: asset)
-            .contains(AVAssetExportPreset1920x1080)
-            ? AVAssetExportPreset1920x1080
-            : AVAssetExportPresetHighestQuality
+        let compatiblePresets = AVAssetExportSession.exportPresets(compatibleWith: asset)
+        let preset: String
+        if resolution == .uhd4K,
+           compatiblePresets.contains(AVAssetExportPreset3840x2160) {
+            preset = AVAssetExportPreset3840x2160
+        } else if compatiblePresets.contains(AVAssetExportPreset1920x1080) {
+            preset = AVAssetExportPreset1920x1080
+        } else {
+            preset = AVAssetExportPresetHighestQuality
+        }
 
         guard let exporter = AVAssetExportSession(asset: asset, presetName: preset) else {
             statusText = "สร้าง TANOO Blur ไม่ได้ — กำลังบันทึกวิดีโอต้นฉบับ"
@@ -2922,6 +2955,8 @@ private struct MovableResizableTeleprompter: View {
 private enum RecordingCountdownAction: Equatable {
     case newRecording
     case resume
+    case newSegment
+    case repeatLatest
 
     var label: String {
         switch self {
@@ -2929,13 +2964,12 @@ private enum RecordingCountdownAction: Equatable {
             return "เริ่มบันทึก"
         case .resume:
             return "บันทึกต่อ"
+        case .newSegment:
+            return "เพิ่มเทคในไฟล์เดิม"
+        case .repeatLatest:
+            return "อัดซ้ำในไฟล์เดิม"
         }
     }
-}
-
-private enum PendingTakeAfterSave {
-    case newTake(TeleprompterPosition)
-    case repeatTake(TeleprompterPosition)
 }
 
 struct CameraStudioView: View {
@@ -2953,9 +2987,8 @@ struct CameraStudioView: View {
     @State private var countdownRemaining: Int?
     @State private var countdownToken = UUID()
     @State private var countdownAction: RecordingCountdownAction?
+    @State private var countdownOriginalPosition: TeleprompterPosition?
     @State private var segmentStartPosition: TeleprompterPosition?
-    @State private var lastTakeStartPosition: TeleprompterPosition?
-    @State private var pendingTakeAfterSave: PendingTakeAfterSave?
 
     var body: some View {
         ZStack {
@@ -3044,7 +3077,7 @@ struct CameraStudioView: View {
             camera.stop()
             horizonMonitor.stop()
             countdownAction = nil
-            pendingTakeAfterSave = nil
+            countdownOriginalPosition = nil
             teleprompter.setUsesExternalSpeech(false)
             cameraStarted = false
         }
@@ -3079,14 +3112,8 @@ struct CameraStudioView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 camera.updateTakePreview(projectName: teleprompter.projectName)
             }
-            continuePendingTakeAfterSave()
         }
-        .onChange(of: camera.resolution) { newResolution in
-            if newResolution == .uhd4K,
-               camera.captureMode == .video,
-               camera.softwareBackgroundBlurEnabled {
-                camera.softwareBackgroundBlurEnabled = false
-            }
+        .onChange(of: camera.resolution) { _ in
             if cameraStarted { camera.reconfigure() }
         }
         .onChange(of: camera.frameRate) { _ in
@@ -3165,13 +3192,13 @@ struct CameraStudioView: View {
             if camera.captureMode == .cinematic && camera.apertureAvailable {
                 Text("·")
                 Text(String(format: "f/%.1f", camera.simulatedAperture))
+            } else if camera.captureMode == .video && camera.softwareBackgroundBlurEnabled {
+                Text("·")
+                Text(String(format: "TANOO BLUR f/%.1f", camera.simulatedAperture))
+                    .foregroundStyle(.green)
             } else if camera.portraitEffectActive {
                 Text("·")
                 Text("PORTRAIT")
-                    .foregroundStyle(.green)
-            } else if camera.captureMode == .video && camera.softwareBackgroundBlurEnabled {
-                Text("·")
-                Text("TANOO BLUR")
                     .foregroundStyle(.green)
             }
             Text("·")
@@ -3273,27 +3300,11 @@ struct CameraStudioView: View {
                 }
 
                 HStack(spacing: 10) {
-                    Menu {
-                        ForEach(CameraCaptureMode.allCases.filter { mode in
-                            mode != .raw || camera.rawAvailable
-                        }) { mode in
-                            Button {
-                                camera.selectMode(mode)
-                            } label: {
-                                if camera.captureMode == mode {
-                                    Label(mode.title, systemImage: "checkmark")
-                                } else {
-                                    Text(mode.title)
-                                }
-                            }
-                            .disabled(!camera.supportsMode(mode))
-                        }
-                    } label: {
-                        Label(camera.captureMode.title, systemImage: "camera.filters")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(activeTake || camera.isReconfiguring)
+                    Label("VIDEO", systemImage: "video.fill")
+                        .font(.caption.bold())
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
 
                     Text(camera.actualRecordingFormat)
                         .font(.caption2.bold())
@@ -3414,7 +3425,7 @@ struct CameraStudioView: View {
                     )
 
                     slider(
-                        title: "Exposure",
+                        title: "ชดเชยแสง",
                         valueText: String(format: "%+.1f", camera.exposureBias),
                         value: Binding(
                             get: { Double(camera.exposureBias) },
@@ -3436,7 +3447,7 @@ struct CameraStudioView: View {
                 .font(.caption2)
 
                 if bluetoothShutterEnabled {
-                    Text("ปุ่มเพิ่มเสียง/รีโมทตอบสนองทันที: REC/Pause • หลัง Pause กด 1 ครั้ง = Resume • กดซ้ำระหว่างนับ = บันทึก Take เดิม แล้วสร้าง Repeat Take เป็นไฟล์ใหม่")
+                    Text("ปุ่มเพิ่มเสียง/รีโมทตอบสนองทันที: REC/Pause • หลัง Pause กด 1 ครั้ง = Resume • กดซ้ำระหว่างนับ = Repeat เทคล่าสุดต่อท้ายในวิดีโอไฟล์เดิม • ไฟล์จะสิ้นสุดเมื่อกด Stop เท่านั้น")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -3537,7 +3548,7 @@ struct CameraStudioView: View {
                                         .frame(width: 42, height: 42)
                                         .background(.blue.opacity(0.78), in: Circle())
                                 }
-                                .accessibilityLabel("บันทึก Take ปัจจุบันแล้วเริ่ม New Take")
+                                .accessibilityLabel("เพิ่มเทคต่อท้ายในวิดีโอไฟล์เดิม")
 
                                 Button {
                                     requestRepeatTake()
@@ -3547,29 +3558,7 @@ struct CameraStudioView: View {
                                         .frame(width: 42, height: 42)
                                         .background(.orange.opacity(0.78), in: Circle())
                                 }
-                                .accessibilityLabel("บันทึก Take ปัจจุบันแล้วสร้าง Repeat Take ใหม่")
-                            }
-                        } else if !camera.lastSavedTakeName.isEmpty {
-                            HStack(spacing: 6) {
-                                Button {
-                                    requestNewTake()
-                                } label: {
-                                    Image(systemName: "plus")
-                                        .font(.headline.bold())
-                                        .frame(width: 42, height: 42)
-                                        .background(.blue.opacity(0.78), in: Circle())
-                                }
-                                .accessibilityLabel("New Take")
-
-                                Button {
-                                    requestRepeatTake()
-                                } label: {
-                                    Image(systemName: "repeat")
-                                        .font(.headline.bold())
-                                        .frame(width: 42, height: 42)
-                                        .background(.orange.opacity(0.78), in: Circle())
-                                }
-                                .accessibilityLabel("Repeat Take")
+                                .accessibilityLabel("อัดเทคล่าสุดซ้ำต่อท้ายในวิดีโอไฟล์เดิม")
                             }
                         } else {
                             Color.clear.frame(width: 52, height: 52)
@@ -3641,98 +3630,44 @@ struct CameraStudioView: View {
 
                 Spacer()
 
-                if camera.captureMode == .cinematic && camera.apertureAvailable {
-                    Text(String(format: "f/%.1f", camera.simulatedAperture))
-                        .font(.caption.monospacedDigit().bold())
-                        .foregroundStyle(.yellow)
-                } else if camera.captureMode == .video && camera.softwareBackgroundBlurEnabled {
-                    Text("TANOO BLUR")
-                        .font(.caption2.bold())
-                        .foregroundStyle(.green)
-                }
+                Text(camera.softwareBackgroundBlurEnabled ? "TANOO BLUR" : "ปิด")
+                    .font(.caption2.bold())
+                    .foregroundStyle(camera.softwareBackgroundBlurEnabled ? .green : .secondary)
             }
 
-            if camera.captureMode == .cinematic && camera.apertureAvailable {
+            HStack(spacing: 8) {
+                Toggle(
+                    "เบลอใน TANOO",
+                    isOn: Binding(
+                        get: { camera.softwareBackgroundBlurEnabled },
+                        set: { camera.softwareBackgroundBlurEnabled = $0 }
+                    )
+                )
+                .font(.caption2.bold())
+                .disabled(activeTake)
+
+                Spacer()
+
+                Text(camera.resolution.rawValue + " " + String(Int(camera.frameRate)) + "fps")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            if camera.softwareBackgroundBlurEnabled {
                 slider(
-                    title: "ระดับเบลอ",
-                    valueText: "F ต่ำ = เบลอมาก",
+                    title: "F (Manual / จำลอง)",
+                    valueText: String(format: "f/%.1f • %.0f%%", camera.simulatedAperture, camera.softwareBackgroundBlurAmount * 100),
                     value: Binding(
                         get: { Double(camera.simulatedAperture) },
-                        set: { camera.setAperture(Float($0)) }
+                        set: { camera.setSoftwareAperture(Float($0)) }
                     ),
-                    range: Double(camera.minSimulatedAperture)...Double(max(
-                        camera.maxSimulatedAperture,
-                        camera.minSimulatedAperture + 0.1
-                    ))
+                    range: 1.4...16
                 )
                 .disabled(activeTake)
 
-                Text("เป็นค่า F จำลองของ Cinematic ไม่ใช่รูรับแสงจริงของเลนส์")
+                Text("F ต่ำ = เบลอมาก • F สูง = เบลอน้อย • รองรับทั้ง 1080p และ 4K • Preview ยังไม่เบลอ และจะประมวลผลลงไฟล์เดียวหลัง Stop")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-            } else if camera.captureMode == .video {
-                HStack(spacing: 8) {
-                    Toggle(
-                        "เบลอใน TANOO",
-                        isOn: Binding(
-                            get: { camera.softwareBackgroundBlurEnabled },
-                            set: { camera.softwareBackgroundBlurEnabled = $0 }
-                        )
-                    )
-                    .font(.caption2.bold())
-                    .disabled(activeTake)
-
-                    Spacer()
-
-                    Text(camera.softwareBackgroundBlurEnabled ? "เปิด" : "ปิด")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(camera.softwareBackgroundBlurEnabled ? .green : .secondary)
-                }
-
-                if camera.softwareBackgroundBlurEnabled {
-                    slider(
-                        title: "ระดับเบลอ",
-                        valueText: String(format: "%.0f%%", camera.softwareBackgroundBlurAmount * 100),
-                        value: Binding(
-                            get: { camera.softwareBackgroundBlurAmount },
-                            set: { camera.softwareBackgroundBlurAmount = $0 }
-                        ),
-                        range: 0.15...1.0
-                    )
-                    .disabled(activeTake)
-
-                    Text("ภาพ Preview จะยังไม่เบลอ • หลังจากกด Stop TANOO จะแยกบุคคลและเบลอพื้นหลังลงในไฟล์เดียวก่อนบันทึก Photos • ใช้ 1080p 30fps เพื่อความเสถียร")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-
-                if camera.cinematicAvailable && camera.captureMode != .cinematic {
-                    Button("ใช้ CINE แทน (เห็นเบลอขณะถ่าย)") {
-                        camera.selectMode(.cinematic)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(activeTake)
-                }
-            } else if camera.captureMode == .cinematic {
-                Text("กล้องหรือ Format นี้ไม่รองรับ simulated aperture จึงปิดตัวปรับ F เพื่อความปลอดภัย")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            } else {
-                HStack(spacing: 8) {
-                    Text("TANOO Blur ใช้ได้ในโหมด VIDEO")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-
-                    Spacer()
-
-                    Button("ใช้ VIDEO") {
-                        camera.selectMode(.video)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .disabled(activeTake)
-                }
             }
         }
         .padding(9)
@@ -3743,7 +3678,7 @@ struct CameraStudioView: View {
     private var manualCameraControls: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Label("PRO Manual", systemImage: "dial.medium")
+                Label("Manual Camera", systemImage: "dial.medium")
                     .font(.caption.bold())
 
                 Picker(
@@ -3774,6 +3709,10 @@ struct CameraStudioView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 } else {
+                    Text("ปรับ F จำลองได้ในแผงฉากหลังเบลอด้านบน • ISO, Shutter และชดเชยแสงใช้ค่าที่กล้องรองรับจริง")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+
                     Toggle(
                         "Manual Focus",
                         isOn: Binding(
@@ -3907,6 +3846,7 @@ struct CameraStudioView: View {
             countdownToken = UUID()
             countdownRemaining = nil
             countdownAction = nil
+            countdownOriginalPosition = nil
             segmentStartPosition = nil
             camera.finishRecording()
             camera.stopSpeech()
@@ -3940,65 +3880,13 @@ struct CameraStudioView: View {
     }
 
     private func requestRepeatTake() {
-        guard !camera.isRecording,
-              !camera.isStartingRecording,
-              !camera.isFinalizingTake else { return }
-
-        cancelCountdown()
-        let position = lastTakeStartPosition ?? teleprompter.capturePosition()
-
-        if camera.isPaused {
-            pendingTakeAfterSave = .repeatTake(position)
-            segmentStartPosition = nil
-            camera.finishRecording()
-            camera.stopSpeech()
-        } else {
-            teleprompter.restorePosition(position)
-            startCountdown(for: .newRecording)
-        }
+        guard camera.isPaused else { return }
+        startCountdown(for: .repeatLatest)
     }
 
     private func requestNewTake() {
-        guard !camera.isRecording,
-              !camera.isStartingRecording,
-              !camera.isFinalizingTake else { return }
-
-        cancelCountdown()
-        let position = teleprompter.capturePosition()
-
-        if camera.isPaused {
-            pendingTakeAfterSave = .newTake(position)
-            segmentStartPosition = nil
-            camera.finishRecording()
-            camera.stopSpeech()
-        } else {
-            startCountdown(for: .newRecording)
-        }
-    }
-
-    private func continuePendingTakeAfterSave() {
-        guard let pendingTakeAfterSave else { return }
-        if camera.isFinalizingTake {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                continuePendingTakeAfterSave()
-            }
-            return
-        }
-        guard !camera.isRecording,
-              !camera.isStartingRecording,
-              !camera.isPaused else { return }
-
-        self.pendingTakeAfterSave = nil
-        let position: TeleprompterPosition
-        switch pendingTakeAfterSave {
-        case .newTake(let value), .repeatTake(let value):
-            position = value
-        }
-
-        teleprompter.restorePosition(position)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            startCountdown(for: .newRecording)
-        }
+        guard camera.isPaused else { return }
+        startCountdown(for: .newSegment)
     }
 
     private func handleRemoteVolumeUp() {
@@ -4031,7 +3919,11 @@ struct CameraStudioView: View {
     private func cancelCountdown() {
         countdownToken = UUID()
         countdownRemaining = nil
+        if countdownAction == .repeatLatest, let countdownOriginalPosition {
+            teleprompter.restorePosition(countdownOriginalPosition)
+        }
         countdownAction = nil
+        countdownOriginalPosition = nil
     }
 
     private func startCountdown(for action: RecordingCountdownAction) {
@@ -4046,10 +3938,25 @@ struct CameraStudioView: View {
         countdownToken = UUID()
         countdownRemaining = nil
 
+        if countdownAction == .repeatLatest,
+           action != .repeatLatest,
+           let countdownOriginalPosition {
+            teleprompter.restorePosition(countdownOriginalPosition)
+            self.countdownOriginalPosition = nil
+        }
+
+        if action == .repeatLatest, countdownAction != .repeatLatest {
+            countdownOriginalPosition = teleprompter.capturePosition()
+            if let segmentStartPosition {
+                teleprompter.restorePosition(segmentStartPosition)
+            }
+        }
+
         countdownAction = action
 
         guard countdownSeconds > 0 else {
             countdownAction = nil
+            countdownOriginalPosition = nil
             performCountdownAction(action)
             return
         }
@@ -4068,6 +3975,7 @@ struct CameraStudioView: View {
             guard countdownToken == token else { return }
             countdownRemaining = nil
             countdownAction = nil
+            countdownOriginalPosition = nil
             performCountdownAction(action)
         }
     }
@@ -4079,6 +3987,11 @@ struct CameraStudioView: View {
         case .resume:
             segmentStartPosition = teleprompter.capturePosition()
             camera.resumeRecording()
+        case .newSegment:
+            segmentStartPosition = teleprompter.capturePosition()
+            camera.resumeRecording()
+        case .repeatLatest:
+            camera.resumeRecording()
         }
     }
 
@@ -4087,7 +4000,6 @@ struct CameraStudioView: View {
 
         let startPosition = teleprompter.capturePosition()
         segmentStartPosition = startPosition
-        lastTakeStartPosition = startPosition
         if teleprompter.isRunning {
             teleprompter.pause()
         }
