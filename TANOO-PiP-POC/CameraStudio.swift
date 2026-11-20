@@ -708,8 +708,12 @@ final class CameraController: NSObject, ObservableObject {
                 let format = device.activeFormat
                 let iso = min(max(manualISO, format.minISO), format.maxISO)
                 let requestedSeconds = 1.0 / max(manualShutterDenominator, 1)
+                let activeFrameSeconds = CMTimeGetSeconds(device.activeVideoMaxFrameDuration)
+                let frameLimitedSeconds = activeFrameSeconds.isFinite && activeFrameSeconds > 0
+                    ? min(requestedSeconds, activeFrameSeconds)
+                    : requestedSeconds
                 var duration = CMTime(
-                    seconds: requestedSeconds,
+                    seconds: frameLimitedSeconds,
                     preferredTimescale: 1_000_000_000
                 )
                 if CMTimeCompare(duration, format.minExposureDuration) < 0 {
@@ -1324,103 +1328,107 @@ final class CameraController: NSObject, ObservableObject {
         var configurationMessage: String?
 
         if captureMode == .video {
-            let requestedPreset: AVCaptureSession.Preset =
-                selectedResolution == .uhd4K ? .hd4K3840x2160 : .hd1920x1080
+            let requestedResolution = selectedResolution
+            let requestedFPS = selectedFPS
 
-            if session.canSetSessionPreset(requestedPreset) {
-                session.sessionPreset = requestedPreset
+            // A session preset may select a 4K format that only supports 30 fps.
+            // Select the device format explicitly so 4K60 and 1080p60 use the
+            // exact hardware format advertised by the current camera.
+            func matchingVideoFormats(
+                resolution: CameraResolution,
+                frameRate: Double
+            ) -> [AVCaptureDevice.Format] {
+                let dimensions = resolution.dimensions
+                let candidates = device.formats.filter { format in
+                    let formatDimensions = CMVideoFormatDescriptionGetDimensions(
+                        format.formatDescription
+                    )
+                    guard formatDimensions.width == dimensions.width,
+                          formatDimensions.height == dimensions.height else { return false }
+
+                    return format.videoSupportedFrameRateRanges.contains { range in
+                        frameRate >= range.minFrameRate && frameRate <= range.maxFrameRate
+                    }
+                }
+
+                // Reuse the active format when possible. Otherwise prefer the
+                // least expensive format whose maximum FPS still covers the
+                // requested value instead of allocating a 120/240 fps format.
+                if let active = candidates.first(where: { $0 === device.activeFormat }) {
+                    return [active] + candidates.filter { $0 !== active }
+                }
+
+                return candidates.sorted { lhs, rhs in
+                    let lhsMaximum = lhs.videoSupportedFrameRateRanges
+                        .map { $0.maxFrameRate }
+                        .max() ?? 0
+                    let rhsMaximum = rhs.videoSupportedFrameRateRanges
+                        .map { $0.maxFrameRate }
+                        .max() ?? 0
+                    return lhsMaximum < rhsMaximum
+                }
+            }
+
+            var requestedConfigurations: [(CameraResolution, Double)] = [
+                (requestedResolution, requestedFPS)
+            ]
+            if requestedFPS != 30 {
+                requestedConfigurations.append((requestedResolution, 30))
+            }
+            if requestedResolution != .hd1080 {
+                requestedConfigurations.append((.hd1080, requestedFPS))
+                if requestedFPS != 30 {
+                    requestedConfigurations.append((.hd1080, 30))
+                }
+            }
+
+            var selectedFormat: AVCaptureDevice.Format?
+            for configuration in requestedConfigurations {
+                if let candidate = matchingVideoFormats(
+                    resolution: configuration.0,
+                    frameRate: configuration.1
+                ).first {
+                    selectedResolution = configuration.0
+                    selectedFPS = configuration.1
+                    selectedFormat = candidate
+                    break
+                }
+            }
+
+            if let selectedFormat {
+                do {
+                    try device.lockForConfiguration()
+                    defer { device.unlockForConfiguration() }
+
+                    // Setting activeFormat makes the session use inputPriority,
+                    // which prevents a preset from replacing our 4K60 choice.
+                    device.activeFormat = selectedFormat
+                    let duration = CMTime(
+                        value: 1,
+                        timescale: CMTimeScale(max(1, Int32(selectedFPS)))
+                    )
+                    device.activeVideoMinFrameDuration = duration
+                    device.activeVideoMaxFrameDuration = duration
+
+                    if device.isExposureModeSupported(.continuousAutoExposure) && !focusExposureLocked {
+                        device.exposureMode = .continuousAutoExposure
+                    }
+                    if device.isFocusModeSupported(.continuousAutoFocus) && !focusExposureLocked {
+                        device.focusMode = .continuousAutoFocus
+                    }
+
+                    if selectedResolution != requestedResolution || selectedFPS != requestedFPS {
+                        configurationMessage = requestedResolution.rawValue + " " +
+                            String(Int(requestedFPS)) + "fps ไม่รองรับกับกล้องนี้ • ใช้ " +
+                            selectedResolution.rawValue + " " + String(Int(selectedFPS)) + "fps"
+                    }
+                } catch {
+                    configurationMessage = "เลือกคุณภาพกล้องไม่สำเร็จ: " + error.localizedDescription
+                }
             } else {
                 selectedResolution = .hd1080
-                if session.canSetSessionPreset(.hd1920x1080) {
-                    session.sessionPreset = .hd1920x1080
-                }
-                configurationMessage = "4K ไม่รองรับกับ configuration นี้ — กลับเป็น 1080p"
-            }
-
-            if #available(iOS 15.0, *), AVCaptureDevice.isPortraitEffectEnabled {
-                func portraitFormats(
-                    resolution: CameraResolution,
-                    frameRate: Double
-                ) -> [AVCaptureDevice.Format] {
-                    let dimensions = resolution.dimensions
-                    return device.formats.filter { format in
-                        let d = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-                        guard d.width == dimensions.width,
-                              d.height == dimensions.height,
-                              format.isPortraitEffectSupported,
-                              let range = format.videoFrameRateRangeForPortraitEffect else { return false }
-                        return frameRate >= range.minFrameRate && frameRate <= range.maxFrameRate
-                    }
-                }
-
-                var portraitCandidates = portraitFormats(
-                    resolution: selectedResolution,
-                    frameRate: selectedFPS
-                )
-
-                if portraitCandidates.isEmpty {
-                    selectedFPS = 30
-                    portraitCandidates = portraitFormats(
-                        resolution: selectedResolution,
-                        frameRate: selectedFPS
-                    )
-                }
-
-                if portraitCandidates.isEmpty {
-                    selectedResolution = .hd1080
-                    if session.canSetSessionPreset(.hd1920x1080) {
-                        session.sessionPreset = .hd1920x1080
-                    }
-                    portraitCandidates = portraitFormats(
-                        resolution: selectedResolution,
-                        frameRate: selectedFPS
-                    )
-                }
-
-                if let portraitFormat = portraitCandidates.first {
-                    do {
-                        try device.lockForConfiguration()
-                        device.activeFormat = portraitFormat
-                        device.unlockForConfiguration()
-                        configurationMessage = "Portrait Effect ใช้ " + selectedResolution.rawValue + " " + String(Int(selectedFPS)) + "fps"
-                    } catch {
-                        configurationMessage = "เลือก Format สำหรับฉากหลังเบลอไม่สำเร็จ: " + error.localizedDescription
-                    }
-                }
-            }
-
-            do {
-                try device.lockForConfiguration()
-
-                let ranges = device.activeFormat.videoSupportedFrameRateRanges
-                let requestedSupported = ranges.contains {
-                    selectedFPS >= $0.minFrameRate && selectedFPS <= $0.maxFrameRate
-                }
-
-                if !requestedSupported {
-                    let thirtySupported = ranges.contains {
-                        30 >= $0.minFrameRate && 30 <= $0.maxFrameRate
-                    }
-                    selectedFPS = thirtySupported ? 30 : (ranges.first?.maxFrameRate ?? 30)
-                    configurationMessage = (configurationMessage ?? "") +
-                        (configurationMessage == nil ? "" : " • ") +
-                        "FPS ปรับเป็น " + String(Int(selectedFPS))
-                }
-
-                let duration = CMTime(value: 1, timescale: CMTimeScale(max(1, Int32(selectedFPS))))
-                device.activeVideoMinFrameDuration = duration
-                device.activeVideoMaxFrameDuration = duration
-
-                if device.isExposureModeSupported(.continuousAutoExposure) && !focusExposureLocked {
-                    device.exposureMode = .continuousAutoExposure
-                }
-                if device.isFocusModeSupported(.continuousAutoFocus) && !focusExposureLocked {
-                    device.focusMode = .continuousAutoFocus
-                }
-
-                device.unlockForConfiguration()
-            } catch {
-                configurationMessage = "ตั้งค่า FPS ไม่สำเร็จ: " + error.localizedDescription
+                selectedFPS = 30
+                configurationMessage = "ไม่พบ Format วิดีโอที่รองรับ 1080p/4K"
             }
         } else {
             // Advanced modes keep format-specific capability checks.
@@ -1641,10 +1649,14 @@ final class CameraController: NSObject, ObservableObject {
             CMTimeGetSeconds(device.activeFormat.minExposureDuration),
             0.000_001
         )
-        let maxExposureSeconds = max(
+        var maxExposureSeconds = max(
             CMTimeGetSeconds(device.activeFormat.maxExposureDuration),
             minExposureSeconds
         )
+        let activeFrameSeconds = CMTimeGetSeconds(device.activeVideoMaxFrameDuration)
+        if activeFrameSeconds.isFinite && activeFrameSeconds > 0 {
+            maxExposureSeconds = min(maxExposureSeconds, activeFrameSeconds)
+        }
         let formatMinShutterDenominator = max(1, 1.0 / maxExposureSeconds)
         let formatMaxShutterDenominator = max(
             formatMinShutterDenominator,

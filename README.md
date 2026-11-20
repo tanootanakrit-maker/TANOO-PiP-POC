@@ -31,6 +31,7 @@ Native iPhone teleprompter that uses Apple's Live Picture in Picture so the prom
 - ค่า F 1.4–16 เป็น simulated aperture ของ TANOO Blur: F ต่ำเบลอมาก, F สูงเบลอน้อย
 - TANOO Blur ทำ Person Segmentation และเบลอพื้นหลังลงในวิดีโอไฟล์สุดท้ายภายในแอป ไม่ต้องมีปุ่ม Portrait ใน Control Center
 - TANOO Blur รองรับ 1080p และ 4K ตามค่าที่เลือก ประมวลผล Person Segmentation หลัง Stop และยังคงเสียงไว้; 4K ต้องมีพื้นที่ว่างอย่างน้อย 4 GB
+- 1080p/4K ที่ 30/60 fps เลือก `activeFormat` จากกล้องจริงโดยตรง; ไม่ใช้ preset ที่อาจลด 4K60 กลับเป็น 30 fps
 - Preview กล้องหน้าเป็นกระจก แต่ recording connection บันทึกภาพจริงที่ตัวหนังสืออ่านถูกด้าน โดยไม่ export พลิกภาพภายหลัง
 - PRO Manual มี Auto/Manual, Manual Focus, Exposure Compensation, ISO, Shutter, Temperature/Tint, Zoom และ Auto reset พร้อม clamp ตาม Format จริง
 
