@@ -103,6 +103,8 @@ final class CameraController: NSObject, ObservableObject {
     private var recordingTimer: Timer?
     private var currentRecordingURL: URL?
     private var recordingSegments: [URL] = []
+    private var takeProjectName = "TANOO"
+    @Published private(set) var lastSavedFilename = ""
     private var stopAction: RecordingStopAction = .finish
     private var resetDurationOnNextSegment = false
     private let speechBridge = CameraSpeechBridge()
@@ -603,7 +605,7 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
-    func startNewTake() {
+    func startNewTake(projectName: String = "TANOO") {
         guard !isRecording, !isPaused, !isStartingRecording, !isFinalizingTake, !isReconfiguring else {
             let message = isReconfiguring
                 ? "REC ยังไม่เริ่ม: กล้องกำลังเปลี่ยนคุณภาพ"
@@ -633,6 +635,7 @@ final class CameraController: NSObject, ObservableObject {
         }
 
         recordPreflightMessage = ""
+        takeProjectName = projectName
         recordingSegments.removeAll()
         currentRecordingURL = nil
         recordingSeconds = 0
@@ -1121,7 +1124,7 @@ final class CameraController: NSObject, ObservableObject {
         }
         if connection.isVideoMirroringSupported {
             connection.automaticallyAdjustsVideoMirroring = false
-            connection.isVideoMirrored = true
+            connection.isVideoMirrored = false
         }
         if connection.isVideoStabilizationSupported {
             connection.preferredVideoStabilizationMode = .auto
@@ -1434,36 +1437,79 @@ final class CameraController: NSObject, ObservableObject {
         }
     }
 
+    // Keep the original named movie in the app's Documents folder. Windows
+    // Apple Devices/iTunes File Sharing can copy the exact .mov filename.
+    private func namedRecordingDestination() throws -> (url: URL, key: String, number: Int) {
+        let forbidden = CharacterSet(charactersIn: "/\\?%*|\"<>:").union(.controlCharacters)
+        let clean = takeProjectName.components(separatedBy: forbidden)
+            .joined(separator: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        let base = clean.isEmpty ? "TANOO" : String(clean.prefix(80))
+        let key = "TANOO.camera.takeNumber." + base.lowercased()
+        let documents = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        let folder = documents.appendingPathComponent("Recordings", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var number = max(0, UserDefaults.standard.integer(forKey: key)) + 1
+        var destination = folder.appendingPathComponent("\(base) Take \(number).mov")
+        while FileManager.default.fileExists(atPath: destination.path) {
+            number += 1
+            destination = folder.appendingPathComponent("\(base) Take \(number).mov")
+        }
+        return (destination, key, number)
+    }
+
     private func saveVideoToPhotos(_ url: URL) {
+        // Move within the app sandbox instead of copying the temporary movie.
+        // The archive is retained even when Photos authorization or import fails.
+        let destination: URL
+        do {
+            let named = try namedRecordingDestination()
+            try FileManager.default.moveItem(at: url, to: named.url)
+            UserDefaults.standard.set(named.number, forKey: named.key)
+            destination = named.url
+            lastSavedFilename = destination.lastPathComponent
+            completedTakeCount += 1
+        } catch {
+            // The source still exists; allow Stop to retry without discarding it.
+            recordingSegments = [url]
+            isPaused = true
+            isFinalizingTake = false
+            recordPreflightMessage = "เก็บไฟล์ไม่สำเร็จ — กด Stop เพื่อลองใหม่: " + error.localizedDescription
+            statusText = recordPreflightMessage
+            return
+        }
+
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
             guard status == .authorized || status == .limited else {
-                try? FileManager.default.removeItem(at: url)
                 self?.refreshDiskSpace()
                 Task { @MainActor in
-                    self?.statusText = "วิดีโอถ่ายสำเร็จ แต่ไม่ได้รับสิทธิ์บันทึกลง Photos"
+                    self?.statusText = "เก็บไฟล์ใน Recordings แล้ว • ไม่ได้รับสิทธิ์ Photos"
                     self?.isFinalizingTake = false
                 }
                 return
             }
 
             PHPhotoLibrary.shared().performChanges({
-                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+                let options = PHAssetResourceCreationOptions()
+                options.originalFilename = destination.lastPathComponent
+                options.shouldMoveFile = false
+                let request = PHAssetCreationRequest.forAsset()
+                request.addResource(with: .video, fileURL: destination, options: options)
             }) { success, error in
                 Task { @MainActor in
                     if success {
-                        self?.statusText = "บันทึกวิดีโอลง Photos แล้ว"
-                        self?.completedTakeCount += 1
-                        self?.isFinalizingTake = false
+                        self?.statusText = "บันทึก Photos และ Recordings แล้ว"
                     } else {
-                        self?.statusText = "บันทึก Photos ไม่สำเร็จ: " + (error?.localizedDescription ?? "Unknown error")
-                        self?.isFinalizingTake = false
+                        self?.statusText = "เก็บไฟล์ใน Recordings แล้ว • Photos ไม่สำเร็จ: " + (error?.localizedDescription ?? "Unknown error")
                     }
+                    self?.isFinalizingTake = false
                 }
-                try? FileManager.default.removeItem(at: url)
                 self?.refreshDiskSpace()
             }
         }
     }
+
 }
 
 extension CameraController: AVCaptureFileOutputRecordingDelegate {
@@ -1949,7 +1995,7 @@ final class PreviewView: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
-        previewLayer.videoGravity = .resizeAspectFill
+        previewLayer.videoGravity = .resizeAspect
         layer.addSublayer(previewLayer)
     }
 
@@ -1969,6 +2015,13 @@ final class PreviewView: UIView {
         precondition(Thread.isMainThread)
         if previewLayer.session !== session {
             previewLayer.session = session
+        }
+        // Only change connection properties when necessary; never reattach
+        // a running PreviewLayer as SwiftUI refreshes the view.
+        if let connection = previewLayer.connection {
+            if connection.isVideoOrientationSupported && connection.videoOrientation != .portrait {
+                connection.videoOrientation = .portrait
+            }
         }
     }
 
@@ -2123,13 +2176,18 @@ private struct MovableResizableTeleprompter: View {
 
     @State private var moveStart: CGPoint?
     @State private var resizeStart: CGSize?
+    @State private var isScrubbing = false
 
     var body: some View {
         GeometryReader { geo in
             let widthRatio = CGFloat(storedWidth)
             let boxHeight = CGFloat(storedHeight)
-            let width = max(200, min(geo.size.width * widthRatio, geo.size.width))
-            let height = max(120, min(boxHeight, geo.size.height * 0.68))
+            let width = max(1, min(max(160, geo.size.width * widthRatio), geo.size.width))
+            let height = max(1, min(max(100, boxHeight), geo.size.height * 0.68))
+            let snapshot = controller.snapshot()
+            let scale = max(0.70, min(1.18, width / 360.0))
+            let visibleCount = min(max(snapshot.visibleLineCount, 1), 6)
+            let rowHeight = max(34, min(height / CGFloat(visibleCount + 1), max(12, snapshot.fontSize * scale) * 1.55 + snapshot.lineSpacing))
             let centerX = clamp(
                 CGFloat(storedCenterX) * geo.size.width,
                 lower: width / 2,
@@ -2148,6 +2206,24 @@ private struct MovableResizableTeleprompter: View {
                 )
             }
             .frame(width: width, height: height)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 4, coordinateSpace: .global)
+                    .onChanged { value in
+                        if !isScrubbing {
+                            isScrubbing = true
+                            controller.beginManualScroll()
+                        }
+                        controller.updateManualScroll(lineOffset: Double(-value.translation.height / max(rowHeight, 1)))
+                    }
+                    .onEnded { _ in
+                        controller.endManualScroll()
+                        isScrubbing = false
+                    }
+            )
+            .onDisappear {
+                if isScrubbing { controller.endManualScroll() }
+            }
             .clipShape(RoundedRectangle(cornerRadius: 10))
             .overlay {
                 RoundedRectangle(cornerRadius: 10)
@@ -2224,7 +2300,6 @@ private struct MovableResizableTeleprompter: View {
             }
             .position(x: centerX, y: centerY)
         }
-        .ignoresSafeArea()
     }
 
     private func clamp(_ value: CGFloat, lower: CGFloat, upper: CGFloat) -> CGFloat {
@@ -2268,54 +2343,54 @@ struct CameraStudioView: View {
     @State private var segmentStartPosition: TeleprompterPosition?
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-
-            if cameraStarted {
-                CameraPreview(controller: camera)
-                    .ignoresSafeArea()
-            } else {
-                launchCameraView
-            }
-
-            if cameraStarted && showGrid {
-                CameraGridOverlay()
-                    .ignoresSafeArea()
-            }
-
-            if cameraStarted && showLevel {
-                HorizonOverlay(rollDegrees: horizonMonitor.rollDegrees)
-            }
-
-            if cameraStarted {
-                MovableResizableTeleprompter(controller: teleprompter)
-            }
-
-            if let countdownRemaining {
-                ZStack {
-                    Color.black.opacity(0.30)
-                        .ignoresSafeArea()
-
-                    VStack(spacing: 4) {
-                        Text(String(countdownRemaining))
-                            .font(.system(size: 110, weight: .bold, design: .rounded))
-
-                        if let countdownAction {
-                            Text(countdownAction.label)
-                                .font(.headline.bold())
-                        }
-                    }
-                    .foregroundStyle(.white)
-                    .shadow(radius: 10)
-                }
-                .allowsHitTesting(false)
-            }
-
+        GeometryReader { outer in
             VStack(spacing: 8) {
-                Spacer()
+                if cameraStarted {
+                    GeometryReader { monitor in
+                        // Fit the entire portrait recording area inside the
+                        // remaining screen, independent of the tool panel.
+                        let width = max(1, min(monitor.size.width, monitor.size.height * 9 / 16))
+                        let height = width * 16 / 9
+                        ZStack {
+                            CameraPreview(controller: camera)
+                            if showGrid {
+                                CameraGridOverlay()
+                                    .allowsHitTesting(false)
+                            }
+                            if showLevel {
+                                HorizonOverlay(rollDegrees: horizonMonitor.rollDegrees)
+                                    .allowsHitTesting(false)
+                            }
+                            MovableResizableTeleprompter(controller: teleprompter)
+                            if let countdownRemaining {
+                                ZStack {
+                                    Color.black.opacity(0.30)
+                                    VStack(spacing: 4) {
+                                        Text(String(countdownRemaining))
+                                            .font(.system(size: 84, weight: .bold, design: .rounded))
+                                        if let countdownAction {
+                                            Text(countdownAction.label)
+                                                .font(.headline.bold())
+                                        }
+                                    }
+                                    .foregroundStyle(.white)
+                                    .shadow(radius: 10)
+                                }
+                                .allowsHitTesting(false)
+                            }
+                        }
+                        .frame(width: width, height: height)
+                        .clipped()
+                        .position(x: monitor.size.width / 2, y: monitor.size.height / 2)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    launchCameraView.frame(maxHeight: .infinity)
+                }
 
                 if controlsExpanded {
                     expandedControls
+                        .frame(height: min(290, max(120, outer.size.height * 0.30)))
                 } else {
                     collapsedTools
                 }
@@ -2323,8 +2398,9 @@ struct CameraStudioView: View {
                 recordDock
             }
             .padding(.bottom, 4)
-            .ignoresSafeArea(edges: .bottom)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .background(Color.black.ignoresSafeArea())
         .statusBarHidden(true)
         .toolbar(.hidden, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
@@ -2764,6 +2840,14 @@ struct CameraStudioView: View {
                 .foregroundStyle(.white)
                 .padding(.horizontal, 14)
 
+            if !camera.lastSavedFilename.isEmpty && !activeTake {
+                Text(camera.lastSavedFilename)
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.85))
+                    .lineLimit(1)
+                    .padding(.horizontal, 12)
+            }
+
             if !camera.recordPreflightMessage.isEmpty {
                 Text(camera.recordPreflightMessage)
                     .font(.caption.bold())
@@ -3115,7 +3199,7 @@ struct CameraStudioView: View {
             teleprompter.pause()
         }
 
-        camera.startNewTake()
+        camera.startNewTake(projectName: teleprompter.projectName)
 
         // If recording never reaches didStartRecording, keep the prompt stopped.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
