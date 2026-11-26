@@ -217,6 +217,8 @@ final class PiPController: NSObject, ObservableObject {
     private let speechTracker = SpeechTracker()
     private var lastMatchedTranscript = ""
     private var usesExternalSpeech = false
+    private var manualScrollStart: Double?
+    private var latestNormalizedVoice = ""
     private var voiceConsumedCharacters = 0
     private var lastVoiceAdvanceAt: CFTimeInterval = 0
 
@@ -382,6 +384,7 @@ final class PiPController: NSObject, ObservableObject {
             return
         }
         isRunning = true
+        latestNormalizedVoice = ""
         voiceConsumedCharacters = 0
         lastVoiceAdvanceAt = 0
         let now = CACurrentMediaTime()
@@ -441,6 +444,37 @@ final class PiPController: NSObject, ObservableObject {
         lastMatchedTranscript = ""
         voiceConsumedCharacters = 0
         lastVoiceAdvanceAt = 0
+        renderViews()
+    }
+
+    // Touch seek is independent of video recording state. Freeze the engine
+    // while the user's finger owns the scroll position, without stopping audio.
+    func beginManualScroll() {
+        guard manualScrollStart == nil, !segments.isEmpty else { return }
+        manualScrollStart = Double(currentIndex) + progress
+    }
+
+    func updateManualScroll(lineOffset: Double) {
+        guard let origin = manualScrollStart, !segments.isEmpty else { return }
+        let position = min(max(0, origin + lineOffset), Double(segments.count - 1))
+        let index = Int(position.rounded(.down))
+        currentIndex = index
+        progress = position - Double(index)
+        renderViews()
+    }
+
+    func endManualScroll() {
+        guard manualScrollStart != nil else { return }
+        manualScrollStart = nil
+        currentIndex = min(max(0, Int((Double(currentIndex) + progress).rounded())), max(0, segments.count - 1))
+        progress = 0
+        let now = CACurrentMediaTime()
+        lastTick = now
+        segmentStartTime = now
+        // Ignore already received cumulative speech, not future speech.
+        voiceConsumedCharacters = latestNormalizedVoice.count
+        lastMatchedTranscript = latestNormalizedVoice
+        lastVoiceAdvanceAt = now
         renderViews()
     }
 
@@ -776,7 +810,7 @@ final class PiPController: NSObject, ObservableObject {
         let now = CACurrentMediaTime()
         lastTick = now
 
-        if isRunning && !segments.isEmpty {
+        if isRunning && !segments.isEmpty && manualScrollStart == nil {
             let current = segments[min(currentIndex, segments.count - 1)]
             let isBlankLine = current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             let shouldAutoAdvance = mode == .auto || mode == .hybrid || isBlankLine
@@ -872,7 +906,8 @@ final class PiPController: NSObject, ObservableObject {
         speechStatus = "ได้ยิน: \(transcript.suffix(60))"
 
         let normalizedTranscript = normalizeForMatching(transcript)
-        guard !normalizedTranscript.isEmpty else { return }
+        latestNormalizedVoice = normalizedTranscript
+        guard manualScrollStart == nil, !normalizedTranscript.isEmpty else { return }
 
         // Speech partial results are cumulative and can be revised.
         if normalizedTranscript.count < voiceConsumedCharacters {
